@@ -1,0 +1,14 @@
+{
+  "name": "GreedyRammer",
+  "version": "1.0",
+  "authors": [
+    "Ayam Gak Jago"
+  ],
+  "description": "Bot ini mengimplementasikan algoritma greedy dengan pendekatan \"selalu kejar dan tabrak musuh yang paling mudah dijangkau\".",
+  "homepage": "",
+  "countryCodes": [
+    "ID"
+  ],
+  "platform": ".Net 10",
+  "programmingLang": "C#"
+}

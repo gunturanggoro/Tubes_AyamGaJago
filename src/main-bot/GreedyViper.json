@@ -1,0 +1,14 @@
+{
+    "name": "GreedyViper",
+    "version": "1.0",
+    "authors": [
+        "Ayam gak Jago"
+    ],
+    "description": "Greedy score hunter with predictive firing and orbit evasion.",
+    "homepage": "",
+    "countryCodes": [
+        "ID"
+    ],
+    "platform": ".Net 10",
+    "programmingLang": "C#"
+}
