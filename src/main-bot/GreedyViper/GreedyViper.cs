@@ -17,6 +17,12 @@ public class GreedyViper : Bot
     // Jumlah giliran maksimum sejak terakhir terdeteksi agar musuh masih dianggap valid
     private const int MaxTargetAge = 18;
 
+    // Dalam arena banyak bot, data ancaman boleh sedikit lebih lama agar bot sadar musuh belakang/samping
+    private const int MaxThreatAge = 30;
+
+    // Jarak proyeksi untuk menilai apakah arah gerak berikutnya aman atau tidak
+    private const double MeleeProjectionDistance = 145.0;
+
     // Lock untuk akses thread-safe ke kamus enemies (karena event berjalan di thread lain)
     private readonly object enemyLock = new object();
 
@@ -90,7 +96,7 @@ public class GreedyViper : Bot
         while (IsRunning)
         {
             // Pilih target terbaik berdasarkan skor greedy
-            Enemy target = SelectGreedyTarget();
+            Enemy? target = SelectGreedyTarget();
 
             if (target == null)
             {
@@ -122,7 +128,7 @@ public class GreedyViper : Bot
 
         lock (enemyLock)
         {
-            Enemy enemy;
+            Enemy? enemy;
             // Tambahkan entri baru jika musuh belum pernah terdeteksi sebelumnya
             if (!enemies.TryGetValue(e.ScannedBotId, out enemy))
             {
@@ -256,21 +262,12 @@ public class GreedyViper : Bot
     /// Memberi bonus kecil jika target adalah musuh yang sama dari giliran sebelumnya
     /// (untuk menghindari pergantian target terus-menerus).
     /// </summary>
-    private Enemy SelectGreedyTarget()
+    private Enemy? SelectGreedyTarget()
     {
-        List<Enemy> snapshot = new List<Enemy>();
-
         // Ambil salinan musuh yang masih aktif dan terdeteksi baru-baru ini
-        lock (enemyLock)
-        {
-            foreach (Enemy enemy in enemies.Values)
-            {
-                if (enemy.Alive && TurnNumber - enemy.LastSeen <= MaxTargetAge)
-                    snapshot.Add(enemy.Clone());
-            }
-        }
+        List<Enemy> snapshot = GetFreshEnemies(MaxTargetAge);
 
-        Enemy best = null;
+        Enemy? best = null;
         double bestScore = double.NegativeInfinity;
 
         foreach (Enemy enemy in snapshot)
@@ -319,10 +316,26 @@ public class GreedyViper : Bot
         double closeThreat = (enemy.Energy / 100.0) * (1.0 - Math.Min(distance, 650.0) / 650.0);
         // Bonus tambahan jika kondisi memungkinkan strategi tabrak
         double ramOpportunity = ShouldRam(enemy, distance) ? 2.5 : 0.0;
+        // Saat melee, musuh dekat di samping/belakang diprioritaskan agar bot tidak tunnel vision
+        double meleeThreatBonus = 0.0;
+        if (IsMeleeMode())
+        {
+            double closeFactor = 1.0 - Math.Min(distance, 560.0) / 560.0;
+            double enemyBearingFromBody = Math.Abs(NormalizeRelativeAngle(DirectionTo(enemy.X, enemy.Y) - Direction));
+            double sideOrBackThreat = enemyBearingFromBody > 70.0 ? 0.9 : 0.0;
+
+            meleeThreatBonus = closeFactor * (1.6 + enemy.Energy / 85.0 + sideOrBackThreat);
+        }
         // Penalti untuk data musuh yang sudah lama tidak diperbarui
         double agePenalty = Math.Max(0, TurnNumber - enemy.LastSeen) * 0.12;
 
-        return hitChance * 5.0 + killBonus + weakBonus + closeThreat * 1.4 + ramOpportunity - agePenalty;
+        return hitChance * 5.0
+            + killBonus
+            + weakBonus
+            + closeThreat * 1.4
+            + ramOpportunity
+            + meleeThreatBonus
+            - agePenalty;
     }
 
     /// <summary>
@@ -332,6 +345,14 @@ public class GreedyViper : Bot
     /// </summary>
     private void ControlRadar(Enemy target)
     {
+        // Di melee, radar tidak boleh terlalu lama mengunci satu musuh.
+        // Sweep berkala menjaga data musuh belakang/samping tetap segar.
+        if (IsMeleeMode() && TurnNumber % 24 < 8)
+        {
+            RadarTurnRate = radarSign * MaxRadarTurnRate;
+            return;
+        }
+
         double bearing = RadarBearingTo(target.X, target.Y);
         double turn = bearing * 2.2;
 
@@ -388,6 +409,12 @@ public class GreedyViper : Bot
     /// </summary>
     private void ControlMovement(Enemy target)
     {
+        if (IsMeleeMode())
+        {
+            ControlMeleeMovement(target);
+            return;
+        }
+
         double distance = DistanceTo(target.X, target.Y);
         bool nearWall = IsNearWall(WallMargin) || TurnNumber < forceCenterUntil;
 
@@ -425,22 +452,140 @@ public class GreedyViper : Bot
                 desiredHeading = DirectionTo(ArenaWidth / 2.0, ArenaHeight / 2.0);
         }
 
-        // Hitung putar badan yang diperlukan
-        double turn = NormalizeRelativeAngle(desiredHeading - Direction);
-        double speed = MaxSpeed;
-
-        // Jika perlu berbalik lebih dari 100°, lebih efisien mundur
-        if (Math.Abs(turn) > 100)
-        {
-            turn = NormalizeRelativeAngle(turn + 180);
-            speed = -MaxSpeed;
-        }
+        // Faktor kecepatan disesuaikan agar bot tidak terlalu liar saat dekat dinding/musuh
+        double speedFactor = 1.0;
 
         // Kurangi kecepatan saat dekat dinding atau terlalu dekat musuh (bukan ram)
         if (nearWall)
-            speed *= 0.75;
+            speedFactor = 0.75;
         else if (distance < 120 && !ShouldRam(target, distance))
-            speed *= 0.65;
+            speedFactor = 0.65;
+
+        MoveToward(desiredHeading, speedFactor);
+    }
+
+    /// <summary>
+    /// Mode khusus arena banyak bot. Bot mengevaluasi beberapa arah kandidat dan
+    /// memilih arah dengan skor keselamatan tertinggi dari semua musuh yang terlihat.
+    /// </summary>
+    private void ControlMeleeMovement(Enemy target)
+    {
+        double targetDistance = DistanceTo(target.X, target.Y);
+        bool nearWall = IsNearWall(WallMargin) || TurnNumber < forceCenterUntil;
+
+        // Perubahan arah lebih sering pada melee supaya pola gerak tidak mudah dibaca.
+        if (TurnNumber - lastReverseTurn > 31)
+            ReverseOrbit();
+
+        if (ShouldRam(target, targetDistance))
+        {
+            MoveToward(DirectionTo(target.X, target.Y), 1.0);
+            return;
+        }
+
+        List<Enemy> threats = GetFreshEnemies(MaxThreatAge);
+        if (threats.Count == 0)
+        {
+            MoveToward(DirectionTo(ArenaWidth / 2.0, ArenaHeight / 2.0), 0.75);
+            return;
+        }
+
+        double bestHeading = Direction;
+        double bestScore = double.NegativeInfinity;
+
+        // Kandidat arah dibuat mengelilingi 360 derajat. Offset kecil per turn
+        // mencegah bot memilih titik yang terlalu repetitif.
+        double offset = (TurnNumber % 2) * 11.25;
+        for (int i = 0; i < 16; i++)
+        {
+            double heading = NormalizeAbsoluteAngle(i * 22.5 + offset);
+            AimPoint projected = Project(X, Y, heading, MeleeProjectionDistance);
+            double score = ScoreMeleePosition(projected, heading, target, threats, nearWall);
+
+            if (score > bestScore)
+            {
+                bestScore = score;
+                bestHeading = heading;
+            }
+        }
+
+        double speedFactor = nearWall ? 0.78 : 1.0;
+        if (targetDistance < 130 && !ShouldRam(target, targetDistance))
+            speedFactor = 0.72;
+
+        MoveToward(bestHeading, speedFactor);
+    }
+
+    /// <summary>
+    /// Fungsi evaluasi greedy untuk movement melee. Posisi yang dipilih adalah posisi
+    /// dengan jarak aman dari dinding, jauh dari musuh terdekat, tidak masuk kerumunan,
+    /// dan tetap bergerak lateral terhadap target tembak.
+    /// </summary>
+    private double ScoreMeleePosition(AimPoint point, double moveHeading, Enemy target, List<Enemy> threats, bool nearWall)
+    {
+        if (point.X < 18 || point.Y < 18 || point.X > ArenaWidth - 18 || point.Y > ArenaHeight - 18)
+            return -1000000.0;
+
+        double wallDistance = Math.Min(
+            Math.Min(point.X, ArenaWidth - point.X),
+            Math.Min(point.Y, ArenaHeight - point.Y)
+        );
+
+        double wallScore = Limit(wallDistance / 130.0, 0.0, 1.6) * (nearWall ? 3.2 : 2.0);
+        double nearestDistance = double.PositiveInfinity;
+        double averageDistance = 0.0;
+        double closePenalty = 0.0;
+        double lateralTotal = 0.0;
+
+        foreach (Enemy enemy in threats)
+        {
+            double distance = Distance(point.X, point.Y, enemy.X, enemy.Y);
+            nearestDistance = Math.Min(nearestDistance, distance);
+            averageDistance += Math.Min(distance, 900.0);
+
+            if (distance < 165.0)
+                closePenalty += (165.0 - distance) / 34.0;
+
+            double enemyDirection = DirectionTo(enemy.X, enemy.Y);
+            lateralTotal += Math.Abs(Math.Sin(ToRadians(NormalizeRelativeAngle(moveHeading - enemyDirection))));
+        }
+
+        averageDistance /= threats.Count;
+        double lateralScore = lateralTotal / threats.Count;
+        double nearestScore = Limit(nearestDistance / 260.0, 0.0, 2.6);
+        double averageScore = Limit(averageDistance / 540.0, 0.0, 1.8);
+
+        double targetDistance = Distance(point.X, point.Y, target.X, target.Y);
+        double idealDistance = Energy > 35.0 ? 430.0 : 520.0;
+        double targetDistanceScore = 1.0 - Math.Min(Math.Abs(targetDistance - idealDistance), 420.0) / 420.0;
+
+        double centerDistance = Distance(point.X, point.Y, ArenaWidth / 2.0, ArenaHeight / 2.0);
+        double maxCenterDistance = Distance(0, 0, ArenaWidth / 2.0, ArenaHeight / 2.0);
+        double centerScore = 1.0 - Math.Min(centerDistance / maxCenterDistance, 1.0);
+
+        return wallScore
+            + nearestScore * 2.4
+            + averageScore * 1.25
+            + lateralScore * 1.35
+            + targetDistanceScore * 0.85
+            + centerScore * 0.45
+            - closePenalty * 2.7;
+    }
+
+    /// <summary>
+    /// Mengubah arah gerak aktual menuju heading tertentu. Jika heading berada jauh
+    /// di belakang badan tank, bot akan mundur agar arah geraknya tetap menuju kandidat.
+    /// </summary>
+    private void MoveToward(double moveHeading, double speedFactor)
+    {
+        double turn = NormalizeRelativeAngle(moveHeading - Direction);
+        double speed = MaxSpeed * Limit(speedFactor, 0.0, 1.0);
+
+        if (Math.Abs(turn) > 100.0)
+        {
+            turn = NormalizeRelativeAngle(turn + 180.0);
+            speed = -speed;
+        }
 
         TurnRate = Limit(turn, -MaxTurnRate, MaxTurnRate);
         TargetSpeed = speed;
@@ -477,6 +622,17 @@ public class GreedyViper : Bot
         // Mode hemat energi saat energi kita rendah
         if (Energy < 18) power = Math.Min(power, 1.15);
         if (Energy < 8)  power = Math.Min(power, 0.55);
+
+        // Saat melee, survival score sering lebih bernilai daripada menukar energi
+        // dengan tembakan besar. Power besar disimpan untuk jarak dekat atau killshot.
+        if (IsMeleeMode() && target.Energy > BulletDamage(power) + 0.2)
+        {
+            double meleeCap = distance < 180.0 ? 1.75 : 1.25;
+            if (Energy < 28.0)
+                meleeCap = Math.Min(meleeCap, 0.95);
+
+            power = Math.Min(power, meleeCap);
+        }
 
         return Limit(power, 0.1, maxAffordable);
     }
@@ -522,6 +678,34 @@ public class GreedyViper : Bot
             && Energy > target.Energy + 14  // Kita jauh lebih kuat
             && target.Energy < 12           // Musuh hampir mati
             && distance < 175;              // Musuh cukup dekat
+    }
+
+    /// <summary>
+    /// Mengecek apakah permainan masih dalam mode melee (musuh banyak).
+    /// </summary>
+    private bool IsMeleeMode()
+    {
+        return EnemyCount > 2;
+    }
+
+    /// <summary>
+    /// Mengambil snapshot musuh yang masih hidup dan masih cukup baru datanya.
+    /// Snapshot dipakai agar logika greedy tidak terganggu event scan yang datang paralel.
+    /// </summary>
+    private List<Enemy> GetFreshEnemies(int maxAge)
+    {
+        List<Enemy> snapshot = new List<Enemy>();
+
+        lock (enemyLock)
+        {
+            foreach (Enemy enemy in enemies.Values)
+            {
+                if (enemy.Alive && TurnNumber - enemy.LastSeen <= maxAge)
+                    snapshot.Add(enemy.Clone());
+            }
+        }
+
+        return snapshot;
     }
 
     /// <summary>
