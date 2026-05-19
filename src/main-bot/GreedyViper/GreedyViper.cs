@@ -81,12 +81,12 @@ public class GreedyViper : Bot
         // Reset semua variabel state dari ronde sebelumnya
         ResetRoundState();
 
-        // Warna tema militer / hijau army
-        BodyColor   = Color.FromArgb(70, 85, 45);    // hijau army utama
-        TurretColor = Color.FromArgb(45, 60, 30);    // hijau gelap
-        RadarColor  = Color.FromArgb(120, 140, 70);  // olive radar
-        BulletColor = Color.FromArgb(170, 220, 90);  // peluru hijau terang
-        ScanColor   = Color.FromArgb(140, 200, 90);  // scan hijau neon lembut
+        // Warna tema putih metal / abu-abu cerah (tema visual modern)
+        BodyColor   = Color.FromArgb(235, 235, 235); // putih utama
+        TurretColor = Color.FromArgb(180, 180, 180); // abu metal
+        RadarColor  = Color.FromArgb(220, 220, 220); // abu terang radar
+        BulletColor = Color.FromArgb(25, 25, 25);    // hitam pekat
+        ScanColor   = Color.FromArgb(160, 160, 160); // efek scan abu lembut
 
         // Senjata dan radar berputar secara independen dari badan
         AdjustGunForBodyTurn = true;
