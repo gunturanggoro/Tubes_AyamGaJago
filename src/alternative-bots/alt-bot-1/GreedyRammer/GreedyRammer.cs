@@ -10,7 +10,10 @@ public class GreedyRammer : Bot
     private const double WALL_MARGIN = 80.0;
 
     // ── Jarak point-blank: hit chance sangat tinggi ──────────────────
-    private const double CLOSE_RANGE = 120.0;
+    private const double CLOSE_RANGE = 10.0;
+
+    // ── Jarak menengah: batas antara peluru berat/ringan ────────────
+    private const double MEDIUM_RANGE = 350.0;
 
     // ── Daya tembak maksimum saat point-blank ───────────────────────
     private const double MAX_FIREPOWER = 3.0;
@@ -25,13 +28,9 @@ public class GreedyRammer : Bot
     private const int SWEEP_INTERVAL = 20;
 
     // ── Durasi satu fase zig-zag (turn) sebelum arah lateral diganti ─
-    // Lebih pendek = zig-zag lebih rapat, lebih susah ditembak
-    // Lebih panjang = arah lebih konsisten ke target
     private const int ZIGZAG_PHASE_TURNS = 12;
 
     // ── Sudut lateral zig-zag dari arah ke target (derajat) ─────────
-    // 25° = zig-zag halus, tetap maju ke target
-    // 45° = zig-zag lebih agresif, lebih susah ditembak tapi lebih lambat
     private const double ZIGZAG_ANGLE = 30.0;
 
     // ── Dictionary semua musuh yang terdeteksi radar ─────────────────
@@ -73,12 +72,6 @@ public class GreedyRammer : Bot
 
     // ═══════════════════════════════════════════════════════════
     // RUN — Loop utama bot
-    //
-    // Urutan setiap turn:
-    //   1. Tentukan mode radar (sweep atau lock)
-    //   2. Jika ada target segar → kejar zig-zag dan tembak
-    //   3. Jika tidak ada → gerak pencarian
-    //   4. Go() kirim semua perintah
     // ═══════════════════════════════════════════════════════════
     public override void Run()
     {
@@ -127,13 +120,11 @@ public class GreedyRammer : Bot
     // ═══════════════════════════════════════════════════════════
     private void ExecuteRadarControl()
     {
-        // Hitung akumulasi putaran radar sejak turn lalu
         double radarDelta = Math.Abs(RadarDirection - _lastRadarDir);
         if (radarDelta > 180) radarDelta = 360 - radarDelta;
         _sweepAccumulated += radarDelta;
         _lastRadarDir      = RadarDirection;
 
-        // Paksa sweep berkala setiap SWEEP_INTERVAL turn
         if (TurnNumber - _lastSweepTurn >= SWEEP_INTERVAL)
         {
             _sweeping         = true;
@@ -143,32 +134,24 @@ public class GreedyRammer : Bot
 
         if (_sweeping)
         {
-            // Putar radar kecepatan maksimum (45°/turn)
             SetTurnRadarLeft(45.0 * _radarSweepDir);
-
-            // Selesai 360° → beralih ke mode lock
             if (_sweepAccumulated >= 360.0)
             {
                 _sweeping         = false;
                 _sweepAccumulated = 0.0;
-                _radarSweepDir   *= -1; // ganti arah untuk sweep berikutnya
+                _radarSweepDir   *= -1;
             }
         }
         else if (_target != null)
         {
-            // Lock radar ke target dengan overshoot
             double radarBearing = RadarBearingTo(_target.X, _target.Y);
             double overshoot    = radarBearing >= 0 ? 22 : -22;
-
-            // Overshoot lebih besar jika target bergerak cepat
             if (_target.Speed > 4)
                 overshoot *= 1.5;
-
             SetTurnRadarLeft(radarBearing + overshoot);
         }
         else
         {
-            // Tidak ada target → sweep lagi
             _sweeping         = true;
             _sweepAccumulated = 0.0;
         }
@@ -177,30 +160,18 @@ public class GreedyRammer : Bot
     // ═══════════════════════════════════════════════════════════
     // EXECUTE RAM CHASE ZIGZAG — Kejar target dengan pola zig-zag
     //
-    // Saat mengejar, bot tidak lari lurus ke target melainkan
-    // bergerak dalam pola zig-zag dengan cara:
-    //   - Setiap ZIGZAG_PHASE_TURNS turn, arah lateral dibalik
-    //   - Arah gerak = bearing ke target ± ZIGZAG_ANGLE derajat
-    //   - Hasilnya bot tetap mendekat ke target tapi lintasannya
-    //     berliku sehingga susah ditebak dan sulit ditembak
-    //
-    // Saat sangat dekat (< CLOSE_RANGE):
-    //   - Berhenti zig-zag, langsung lurus ke target untuk ram
-    //   - TargetSpeed maksimal untuk memaksimalkan ram damage
-    //
-    // Saat dekat dinding:
-    //   - Abaikan zig-zag, langsung putar ke tengah arena
+    // Saat mengejar, bot bergerak zig-zag agar sulit ditembak.
+    // Saat sudah dekat (< CLOSE_RANGE), langsung seruduk lurus.
     // ═══════════════════════════════════════════════════════════
     private void ExecuteRamChaseZigzag(EnemyInfo target)
     {
-        // Prioritas tertinggi: hindari dinding
         if (IsNearWall())
         {
             double centerBearing = BearingTo(ArenaWidth / 2.0, ArenaHeight / 2.0);
             SetTurnLeft(centerBearing);
             SetForward(200);
             TargetSpeed    = 8;
-            _zigzagCounter = 0; // reset zig-zag setelah keluar dinding
+            _zigzagCounter = 0;
             return;
         }
 
@@ -209,71 +180,111 @@ public class GreedyRammer : Bot
 
         if (distance < CLOSE_RANGE)
         {
-            // ── Fase RAM: sudah dekat → lurus penuh ke target ──
-            // Tidak perlu zig-zag lagi, langsung seruduk
+            // Fase RAM: sudah dekat → lurus penuh ke target
             SetTurnLeft(bearingToTarget);
-            SetForward(distance + 100); // +100 agar menembus posisi target
+            SetForward(distance + 100);
             TargetSpeed    = 8;
             _zigzagCounter = 0;
         }
         else
         {
-            // ── Fase ZIG-ZAG: masih jauh → zig-zag sambil mendekat ──
-
-            // Update counter dan ganti fase jika sudah cukup lama
+            // Fase ZIG-ZAG: masih jauh → zig-zag sambil mendekat
             _zigzagCounter++;
             if (_zigzagCounter >= _zigzagPhaseLimit)
             {
                 _zigzagCounter    = 0;
-                _zigzagDir       *= -1; // balik arah lateral
-
-                // Variasi durasi fase (8-16 turn) agar tidak terpola
+                _zigzagDir       *= -1;
                 _zigzagPhaseLimit = _rng.Next(8, 17);
             }
 
-            // Arah gerak = bearing ke target + offset lateral zig-zag
-            // +ZIGZAG_ANGLE = miring ke kiri dari target
-            // -ZIGZAG_ANGLE = miring ke kanan dari target
             double zigzagBearing = bearingToTarget + ZIGZAG_ANGLE * _zigzagDir;
             SetTurnLeft(zigzagBearing);
-
-            // Maju cukup jauh agar bot tidak berhenti di tengah jalan
-            // Jarak penuh ke target agar selalu bergerak mendekat
             SetForward(distance);
-            TargetSpeed = 8; // tetap kecepatan maksimal saat zig-zag
+            TargetSpeed = 8;
         }
     }
 
     // ═══════════════════════════════════════════════════════════
     // EXECUTE RAM FIRE — Tembak sambil mengejar
     //
-    // Tembakan berbasis hit chance — tidak tembak jika peluang
-    // mengenai musuh terlalu kecil (buang energi sia-sia).
+    // PERBAIKAN dari versi sebelumnya:
     //
-    // Evaluasi setiap opsi firepower dan pilih yang paling
-    // menguntungkan berdasarkan: damage × hitChance - energyPenalty
+    // 1. Prediksi posisi musuh saat peluru tiba (linear prediction)
+    //    Tanpa prediksi, gun selalu tertinggal saat musuh berlari.
+    //    Gun diarahkan ke posisi prediksi, bukan posisi saat ini.
     //
-    // Logika fire power:
-    //   - Jarak jauh, gun masih miring → skip (hit chance < 0.25)
-    //   - Jarak jauh, gun sudah lurus  → fp 1.5-2.0 (peluru cepat)
-    //   - Jarak dekat, gun lurus       → fp 2.5-3.0 (damage besar)
-    //   - Energi kritis                → penalti ×2, pilih fp hemat
+    // 2. Firepower berbasis jarak, bukan threshold hitChance:
+    //    - Kritis (energi < 15)   → fp 1.0 saja (hemat energi)
+    //    - Jarak dekat (< 120)    → fp 2.5-3.0 (damage maksimal)
+    //    - Jarak menengah (< 350) → fp 1.5-2.5 (seimbang)
+    //    - Jarak jauh (≥ 350)     → fp 1.0-1.5 (peluru cepat agar
+    //                               bisa mengejar musuh yang lari)
+    //
+    // 3. Threshold hitChance diturunkan menjadi 0.10 (dari 0.25)
+    //    Saat musuh lari, sedikit tembakan tetap lebih baik daripada
+    //    tidak menembak sama sekali dan mati tanpa melawan.
+    //
+    // 4. Fallback minimum fire: jika semua opsi gagal scoring tapi
+    //    gun sudah cukup lurus (< 15°), tetap tembak fp 1.0 agar
+    //    bot tidak pernah diam sepenuhnya saat dikejar.
     // ═══════════════════════════════════════════════════════════
     private void ExecuteRamFire(EnemyInfo target)
     {
-        double distance      = DistanceTo(target.X, target.Y);
-        double gunBearing    = GunBearingTo(target.X, target.Y);
-        double absGunBearing = Math.Abs(gunBearing);
+        if (GunHeat != 0) return;
+        if (Energy   < 1.0) return;
 
-        // Arahkan gun ke target
+        // ── Prediksi posisi musuh saat peluru tiba ───────────────────
+        // Iterasi 3x hingga travelTime konvergen dengan jarak prediksi
+        double predX = target.X;
+        double predY = target.Y;
+        // Gunakan fp 1.5 sebagai estimasi awal untuk prediksi posisi
+        double estFp = Energy < ENERGY_CRITICAL ? 1.0 : 1.5;
+        for (int i = 0; i < 3; i++)
+        {
+            double bulletSpeed = CalcBulletSpeed(estFp);
+            double dist        = DistanceTo(predX, predY);
+            double travelTime  = dist / bulletSpeed;
+            double rad         = target.Direction * Math.PI / 180.0;
+            predX = target.X + Math.Cos(rad) * target.Speed * travelTime;
+            predY = target.Y + Math.Sin(rad) * target.Speed * travelTime;
+
+            // Clamp agar prediksi tidak keluar arena
+            predX = Math.Clamp(predX, WALL_MARGIN, ArenaWidth  - WALL_MARGIN);
+            predY = Math.Clamp(predY, WALL_MARGIN, ArenaHeight - WALL_MARGIN);
+        }
+
+        // Arahkan gun ke posisi prediksi (bukan posisi saat ini)
+        double gunBearing    = GunBearingTo(predX, predY);
+        double absGunBearing = Math.Abs(gunBearing);
         SetTurnGunLeft(gunBearing);
 
-        if (GunHeat != 0)    return;
-        if (Energy    < 1.0) return;
+        double distance = DistanceTo(target.X, target.Y);
 
-        double[] fireOptions = { 1.5, 2.0, 2.5, 3.0 };
-        double   bestScore   = double.NegativeInfinity;
-        double   bestFp      = -1;
+        // ── Tentukan opsi firepower berdasarkan jarak & energi ───────
+        double[] fireOptions;
+        if (Energy < ENERGY_CRITICAL)
+        {
+            // Energi kritis: hemat, hanya tembak ringan
+            fireOptions = new[] { 1.0 };
+        }
+        else if (distance < CLOSE_RANGE)
+        {
+            // Point-blank: peluru berat untuk damage + ram combo
+            fireOptions = new[] { 2.5, 3.0 };
+        }
+        else if (distance < MEDIUM_RANGE)
+        {
+            // Jarak menengah: seimbang antara kecepatan dan damage
+            fireOptions = new[] { 1.5, 2.0, 2.5 };
+        }
+        else
+        {
+            // Jarak jauh / musuh lari: peluru ringan lebih cepat sampai
+            fireOptions = new[] { 1.0, 1.5 };
+        }
+
+        double bestScore = double.NegativeInfinity;
+        double bestFp    = -1;
 
         foreach (double fp in fireOptions)
         {
@@ -281,12 +292,14 @@ public class GreedyRammer : Bot
 
             double hitChance = EstimateHitChance(distance, absGunBearing, target.Speed, fp);
 
-            // Tidak tembak jika peluang mengenai < 25%
-            if (hitChance < 0.25) continue;
+            // Threshold diturunkan ke 0.10 agar tetap tembak saat musuh
+            // menjauh — lebih baik tembak dengan peluang kecil daripada
+            // tidak tembak sama sekali dan terus menerima damage gratis
+            if (hitChance < 0.10) continue;
 
-            double damage        = 4.0 * fp + (fp > 1 ? 2.0 * (fp - 1) : 0);
+            double damage       = 4.0 * fp + (fp > 1 ? 2.0 * (fp - 1) : 0);
             double energyPenalty = fp * (Energy < ENERGY_CRITICAL ? 2.0 : 1.0);
-            double score         = damage * hitChance - energyPenalty;
+            double score        = damage * hitChance - energyPenalty;
 
             if (score > bestScore)
             {
@@ -296,20 +309,21 @@ public class GreedyRammer : Bot
         }
 
         if (bestFp > 0)
+        {
             SetFire(bestFp);
+        }
+        else if (absGunBearing < 15.0 && Energy > 1.2)
+        {
+            // ── Fallback minimum fire ────────────────────────────────
+            // Semua opsi gagal threshold, tapi gun sudah cukup lurus.
+            // Tembak peluru ringan agar bot tidak diam tanpa melawan
+            // saat musuh terus menembaki kita dari kejauhan.
+            SetFire(Math.Min(1.0, Energy - 0.2));
+        }
     }
 
     // ═══════════════════════════════════════════════════════════
     // ESTIMATE HIT CHANCE — Estimasi peluang peluru mengenai target
-    //
-    // Tiga faktor:
-    //   distanceFactor : makin jauh → peluang makin kecil.
-    //                    fp kecil = peluru lebih cepat = sedikit
-    //                    mengurangi penalti jarak
-    //   aimFactor      : makin lurus gun → peluang makin besar.
-    //                    threshold ketat (/ 35) karena rammer
-    //                    tidak perlu tembak saat gun masih miring
-    //   speedFactor    : musuh bergerak cepat → lebih susah kena
     // ═══════════════════════════════════════════════════════════
     private static double EstimateHitChance(
         double distance, double gunOffset, double enemySpeed, double fp)
@@ -323,9 +337,6 @@ public class GreedyRammer : Bot
 
     // ═══════════════════════════════════════════════════════════
     // EXECUTE SEARCH PATTERN — Gerak saat tidak ada target
-    //
-    // Bergerak ke tengah arena agar posisi strategis.
-    // Radar sudah dihandle ExecuteRadarControl() (mode sweep).
     // ═══════════════════════════════════════════════════════════
     private void ExecuteSearchPattern()
     {
@@ -339,9 +350,6 @@ public class GreedyRammer : Bot
 
     // ═══════════════════════════════════════════════════════════
     // ON SCANNED BOT — Update data musuh dan pilih target
-    //
-    // Hanya update data — tidak ada perintah gerak/tembak
-    // agar tidak menimpa perintah dari Run() loop.
     // ═══════════════════════════════════════════════════════════
     public override void OnScannedBot(ScannedBotEvent e)
     {
@@ -359,17 +367,12 @@ public class GreedyRammer : Bot
 
     // ═══════════════════════════════════════════════════════════
     // ON HIT BOT — Berhasil menabrak bot musuh
-    //
-    // Tembak point-blank saat tabrakan lalu langsung maju lagi
-    // untuk serudukan berikutnya. Reset zig-zag agar langsung
-    // lurus ke target tanpa delay ganti fase.
     // ═══════════════════════════════════════════════════════════
     public override void OnHitBot(HitBotEvent e)
     {
         if (GunHeat == 0 && Energy > MAX_FIREPOWER + 0.1)
             SetFire(MAX_FIREPOWER);
 
-        // Reset zig-zag → fase berikutnya mulai dari nol
         _zigzagCounter    = 0;
         _zigzagPhaseLimit = ZIGZAG_PHASE_TURNS;
 
@@ -380,17 +383,12 @@ public class GreedyRammer : Bot
 
     // ═══════════════════════════════════════════════════════════
     // ON HIT BY BULLET — Kena tembakan
-    //
-    // Segera balik arah zig-zag dan reset counter fase agar
-    // pola berubah dan peluru berikutnya tidak kena lagi.
-    // Mundur hanya saat energi kritis.
     // ═══════════════════════════════════════════════════════════
     public override void OnHitByBullet(HitByBulletEvent e)
     {
-        // Balik arah zig-zag dan reset fase agar pola berubah
         _zigzagDir        *= -1;
         _zigzagCounter     = 0;
-        _zigzagPhaseLimit  = _rng.Next(6, 13); // fase pendek setelah kena tembak
+        _zigzagPhaseLimit  = _rng.Next(6, 13);
 
         if (Energy < ENERGY_CRITICAL)
         {
@@ -402,9 +400,6 @@ public class GreedyRammer : Bot
 
     // ═══════════════════════════════════════════════════════════
     // ON HIT WALL — Menabrak dinding
-    //
-    // Mundur, putar ke tengah arena, dan paksa sweep ulang.
-    // Reset zig-zag agar tidak langsung menabrak dinding lagi.
     // ═══════════════════════════════════════════════════════════
     public override void OnHitWall(HitWallEvent e)
     {
@@ -412,16 +407,13 @@ public class GreedyRammer : Bot
         SetTurnLeft(BearingTo(ArenaWidth / 2.0, ArenaHeight / 2.0));
         _sweeping         = true;
         _sweepAccumulated = 0.0;
-        _zigzagDir       *= -1; // balik arah zig-zag setelah nabrak dinding
+        _zigzagDir       *= -1;
         _zigzagCounter    = 0;
         Go();
     }
 
     // ═══════════════════════════════════════════════════════════
     // ON BOT DEATH — Musuh mati
-    //
-    // Hapus dari kandidat, reset target, paksa sweep ulang
-    // untuk menemukan musuh berikutnya secepatnya.
     // ═══════════════════════════════════════════════════════════
     public override void OnBotDeath(BotDeathEvent e)
     {
@@ -438,11 +430,6 @@ public class GreedyRammer : Bot
     // SELECT CLOSEST TARGET — Fungsi seleksi greedy utama
     //
     // Memilih musuh dengan jarak terkecil sebagai target.
-    //   - Musuh terdekat paling cepat dicapai → waktu tempuh minimum
-    //   - Ram Damage = 2x damage biasa
-    //   - Ram Damage Bonus +30% jika musuh mati karena tabrakan
-    //   - Jarak pendek = paparan tembakan musuh lain lebih sedikit
-    // Data basi dilewati karena posisi musuh tidak akurat untuk ram.
     // ═══════════════════════════════════════════════════════════
     private void SelectClosestTarget()
     {
@@ -482,9 +469,6 @@ public class GreedyRammer : Bot
 
 // ═══════════════════════════════════════════════════════════════
 // ENEMY INFO — Data class informasi musuh
-//
-// Distance     : kriteria seleksi greedy (terkecil = prioritas tertinggi)
-// LastSeenTurn : untuk filter data basi
 // ═══════════════════════════════════════════════════════════════
 internal record EnemyInfo(
     int    Id,
