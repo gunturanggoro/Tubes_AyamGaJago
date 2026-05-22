@@ -161,11 +161,47 @@ public class TankAlbino : Bot
                 enemy = new Enemy();
                 enemy.Id = e.ScannedBotId;
                 enemy.PreviousEnergy = e.Energy;
+                enemy.PreviousX = e.X;
+                enemy.PreviousY = e.Y;
+                enemy.PreviousDirection = e.Direction;
+                enemy.PreviousSpeed = e.Speed;
+                enemy.PreviousScanTurn = e.TurnNumber;
                 enemies[e.ScannedBotId] = enemy;
             }
 
             // Hitung penurunan energi musuh dibanding pembacaan sebelumnya
             double energyDrop = enemy.Energy - e.Energy;
+            int scanDelta = Math.Max(1, e.TurnNumber - enemy.LastSeen);
+            double previousLateralVelocity = enemy.LateralVelocity;
+
+            if (enemy.LastSeen > 0)
+            {
+                enemy.PreviousX = enemy.X;
+                enemy.PreviousY = enemy.Y;
+                enemy.PreviousDirection = enemy.Direction;
+                enemy.PreviousSpeed = enemy.Speed;
+                enemy.PreviousScanTurn = enemy.LastSeen;
+
+                double velocityX = (e.X - enemy.X) / scanDelta;
+                double velocityY = (e.Y - enemy.Y) / scanDelta;
+                double dx = e.X - X;
+                double dy = e.Y - Y;
+                double distanceForLateral = Math.Max(1.0, Math.Sqrt(dx * dx + dy * dy));
+                double lateralVelocity = (velocityY * dx - velocityX * dy) / distanceForLateral;
+
+                enemy.VelocityX = velocityX;
+                enemy.VelocityY = velocityY;
+                enemy.PreviousLateralVelocity = previousLateralVelocity;
+                enemy.LateralVelocity = lateralVelocity;
+                enemy.Acceleration = (e.Speed - enemy.Speed) / scanDelta;
+
+                if (Math.Abs(previousLateralVelocity) > 0.35
+                    && Math.Abs(lateralVelocity) > 0.35
+                    && Math.Sign(previousLateralVelocity) != Math.Sign(lateralVelocity))
+                {
+                    enemy.LastLateralChangeTurn = e.TurnNumber;
+                }
+            }
 
             // Perbarui semua data terbaru musuh
             enemy.X = e.X;
@@ -386,9 +422,9 @@ public class TankAlbino : Bot
     /// </summary>
     private void ControlRadar(Enemy target)
     {
-        // Setelah terkena peluru atau melihat musuh menembak, lakukan sweep paksa.
-        // Ini mengurangi blind spot samping/belakang yang sering muncul saat radar terlalu lama lock target.
-        if (TurnNumber < forcedRadarSweepUntil)
+        // Sweep paksa hanya dipakai saat melee. Dalam duel 1v1, radar harus tetap lock
+        // agar data target selalu fresh dan tembakan prediktif tidak memakai posisi basi.
+        if (IsMeleeMode() && TurnNumber < forcedRadarSweepUntil)
         {
             RadarTurnRate = radarSign * MaxRadarTurnRate;
             return;
@@ -431,8 +467,9 @@ public class TankAlbino : Bot
         if (power < 0.1)
             return; // Daya tembak terlalu kecil, tidak layak menembak
 
-        // Hitung posisi prediksi musuh saat peluru tiba
-        AimPoint aim = PredictEnemyPosition(target, power);
+        // Hitung posisi prediksi musuh. Untuk target zig-zag cepat, gunakan lead
+        // yang lebih pendek agar tembakan tidak terus melewati arah belok target.
+        AimPoint aim = SelectAimPoint(target, power);
         double preciseDistance = DistanceTo(aim.X, aim.Y);
         double gunBearing = GunBearingTo(aim.X, aim.Y);
 
@@ -444,8 +481,9 @@ public class TankAlbino : Bot
         bool gunReady = GunHeat == 0;                        // Senjata tidak sedang mendingin
         bool aligned = Math.Abs(gunBearing) <= fireWindow;   // Senjata cukup lurus
         bool affordable = Energy > power + 0.25;             // Energi kita mencukupi
+        bool freshTarget = TurnNumber - target.LastSeen <= 4; // Hindari menembak posisi lama
 
-        if (gunReady && aligned && affordable)
+        if (gunReady && aligned && affordable && freshTarget)
             SetFire(power);
     }
 
@@ -608,7 +646,11 @@ public class TankAlbino : Bot
 
         double wallScore = Limit(wallDistance / 130.0, 0.0, 1.8) * 2.2;
         double targetDistance = Distance(point.X, point.Y, target.X, target.Y);
-        double idealDistance = Energy > 32.0 ? 555.0 : 630.0;
+        // Saat wave/peluru datang, prioritaskan survival dengan jarak lebih jauh.
+        // Saat tidak sedang menghindar, kembali ke jarak menengah agar prediksi tembakan lebih akurat.
+        double idealDistance = jinkMode
+            ? (Energy > 32.0 ? 555.0 : 630.0)
+            : (Energy > 32.0 ? 460.0 : 520.0);
         double distanceScore = 1.0 - Math.Min(Math.Abs(targetDistance - idealDistance), 520.0) / 520.0;
         double currentTargetDistance = DistanceTo(target.X, target.Y);
         double tooClosePenalty = targetDistance < 260.0 ? (260.0 - targetDistance) / 42.0 : 0.0;
@@ -1133,6 +1175,11 @@ public class TankAlbino : Bot
         if (target.Energy <= 18)
             power = Math.Min(power, RequiredPowerToKill(target.Energy) + 0.08);
 
+        // Target yang sering zig-zag lebih baik ditembak dengan peluru cepat.
+        // Damage turun sedikit, tetapi waktu tempuh peluru lebih pendek sehingga peluang hit naik.
+        if (!IsMeleeMode() && IsZigzaggingTarget(target) && distance > 210.0)
+            power = Math.Min(power, HasRecentLateralReversal(target) ? 1.05 : 1.25);
+
         // Kurangi daya jika senjata tidak terlalu lurus atau jarak terlalu jauh
         if (Math.Abs(gunBearing) > 28 || distance > 850)
             power = Math.Min(power, 0.85);
@@ -1183,6 +1230,99 @@ public class TankAlbino : Bot
         }
 
         return new AimPoint(px, py);
+    }
+
+    /// <summary>
+    /// Memilih model aiming. Target yang sering membalik arah lateral ditembak
+    /// dengan prediksi pendek/head-on agar tidak terus tertipu zig-zag.
+    /// </summary>
+    private AimPoint SelectAimPoint(Enemy target, double firepower)
+    {
+        if (IsMeleeMode())
+            return PredictEnemyPosition(target, firepower);
+
+        if (!IsZigzaggingTarget(target))
+            return PredictEnemyPosition(target, firepower);
+
+        double distance = DistanceTo(target.X, target.Y);
+        double leadScale;
+
+        if (HasRecentLateralReversal(target))
+            leadScale = distance < 280.0 ? 0.24 : 0.18;
+        else
+            leadScale = distance < 360.0 ? 0.52 : 0.40;
+
+        AimPoint shortLead = PredictObservedEnemyPosition(target, firepower, leadScale);
+
+        // Kalau musuh baru saja berbalik, titik sekarang sering lebih benar daripada
+        // prediksi linear penuh. Pilih yang membutuhkan perubahan gun lebih kecil.
+        if (HasRecentLateralReversal(target))
+        {
+            double headOnBearing = Math.Abs(GunBearingTo(target.X, target.Y));
+            double shortLeadBearing = Math.Abs(GunBearingTo(shortLead.X, shortLead.Y));
+
+            if (headOnBearing <= shortLeadBearing + 1.8)
+                return new AimPoint(target.X, target.Y);
+        }
+
+        return shortLead;
+    }
+
+    /// <summary>
+    /// Prediksi berbasis perpindahan nyata antar-scan, bukan arah body. Lebih stabil
+    /// melawan bot yang sering maju-mundur atau membelokkan body saat menghindar.
+    /// </summary>
+    private AimPoint PredictObservedEnemyPosition(Enemy target, double firepower, double leadScale)
+    {
+        double bulletSpeed = Math.Max(0.1, CalcBulletSpeed(firepower));
+        double vx = target.VelocityX;
+        double vy = target.VelocityY;
+
+        if (Math.Abs(vx) + Math.Abs(vy) < 0.05)
+        {
+            double radians = ToRadians(target.Direction);
+            vx = Math.Cos(radians) * target.Speed;
+            vy = Math.Sin(radians) * target.Speed;
+        }
+
+        double px = target.X;
+        double py = target.Y;
+
+        for (int i = 0; i < 3; i++)
+        {
+            double travelTime = DistanceTo(px, py) / bulletSpeed;
+            travelTime = Limit(travelTime, 0.0, 48.0);
+
+            px = target.X + vx * travelTime * leadScale;
+            py = target.Y + vy * travelTime * leadScale;
+            px = Limit(px, 18, ArenaWidth - 18);
+            py = Limit(py, 18, ArenaHeight - 18);
+        }
+
+        return new AimPoint(px, py);
+    }
+
+    /// <summary>
+    /// Deteksi sederhana untuk target yang bergerak lateral cepat atau sering
+    /// membalik arah, seperti GreedyViper dengan pola kiri-kanan.
+    /// </summary>
+    private bool IsZigzaggingTarget(Enemy target)
+    {
+        double distance = DistanceTo(target.X, target.Y);
+        bool lateralFast = Math.Abs(target.LateralVelocity) > 2.2 && distance > 170.0;
+        bool recentReverse = HasRecentLateralReversal(target);
+        bool highAcceleration = Math.Abs(target.Acceleration) > 0.75 && Math.Abs(target.Speed) > 2.5;
+
+        return lateralFast || recentReverse || highAcceleration;
+    }
+
+    /// <summary>
+    /// True jika target baru membalik arah lateral dalam beberapa turn terakhir.
+    /// </summary>
+    private bool HasRecentLateralReversal(Enemy target)
+    {
+        return target.LastLateralChangeTurn > 0
+            && TurnNumber - target.LastLateralChangeTurn <= 16;
     }
 
     /// <summary>
@@ -1390,12 +1530,23 @@ public class TankAlbino : Bot
         public int Id;
         public double X;
         public double Y;
+        public double PreviousX;
+        public double PreviousY;
         public double Energy;
         public double PreviousEnergy; // Energi musuh pada scan sebelumnya (untuk deteksi tembakan)
         public double Direction;
+        public double PreviousDirection;
         public double Speed;
+        public double PreviousSpeed;
         public double Distance;
         public int LastSeen;          // Nomor giliran terakhir saat musuh ini terdeteksi
+        public int PreviousScanTurn;
+        public double VelocityX;
+        public double VelocityY;
+        public double LateralVelocity;
+        public double PreviousLateralVelocity;
+        public double Acceleration;
+        public int LastLateralChangeTurn = -999;
         public bool Alive = true;
 
         /// <summary>
