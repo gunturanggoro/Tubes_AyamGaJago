@@ -26,6 +26,9 @@ public class TankAlbino : Bot
     // Jarak proyeksi pendek untuk mengecek apakah mundur akan masuk blind spot/dinding
     private const double ReverseProjectionDistance = 105.0;
 
+    // Lebar koridor garis tembak antar-musuh yang harus dihindari pada mode melee
+    private const double CrossfireLineWidth = 82.0;
+
     // Lock untuk akses thread-safe ke kamus enemies (karena event berjalan di thread lain)
     private readonly object enemyLock = new object();
 
@@ -67,7 +70,7 @@ public class TankAlbino : Bot
     /// </summary>
     public TankAlbino() : base(new BotInfo(
         "TankAlbino",
-        "1.9",
+        "2.0",
         new List<string> { "Ayam Gak Jago" },
         "Bot ini mengimplementasikan algoritma greedy dengan pendekatan \"serangan dan pertahanan ditentukan melalui pemilihan target berbasis skor, tembakan prediktif, orbit evasion, dan pergerakan adaptif.\"",
         null,
@@ -568,6 +571,25 @@ public class TankAlbino : Bot
             }
         }
 
+        List<double> tacticalHeadings = new List<double>
+        {
+            DirectionTo(ArenaWidth / 2.0, ArenaHeight / 2.0),
+            EscapeHeadingFromCrossfire(threats),
+            EscapeHeadingFromThreatCentroid(threats)
+        };
+
+        foreach (double heading in tacticalHeadings)
+        {
+            AimPoint projected = Project(X, Y, heading, MeleeProjectionDistance);
+            double score = ScoreMeleePosition(projected, heading, target, threats, nearWall);
+
+            if (score > bestScore)
+            {
+                bestScore = score;
+                bestHeading = heading;
+            }
+        }
+
         double speedFactor = nearWall ? 0.78 : 1.0;
         if (targetDistance < 130 && !ShouldRam(target, targetDistance))
             speedFactor = 0.72;
@@ -621,6 +643,7 @@ public class TankAlbino : Bot
         double centerDistance = Distance(point.X, point.Y, ArenaWidth / 2.0, ArenaHeight / 2.0);
         double maxCenterDistance = Distance(0, 0, ArenaWidth / 2.0, ArenaHeight / 2.0);
         double centerScore = 1.0 - Math.Min(centerDistance / maxCenterDistance, 1.0);
+        double crossfirePenalty = ScoreCrossfireDanger(point, threats);
 
         return wallScore
             + nearestScore * 2.4
@@ -628,7 +651,8 @@ public class TankAlbino : Bot
             + lateralScore * 1.35
             + targetDistanceScore * 0.85
             + centerScore * 0.45
-            - closePenalty * 2.7;
+            - closePenalty * 2.7
+            - crossfirePenalty * 3.0;
     }
 
     /// <summary>
@@ -680,6 +704,106 @@ public class TankAlbino : Bot
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Mengukur bahaya crossfire: posisi kandidat berada di koridor lurus antara dua musuh.
+    /// Jika dua musuh saling menembak, peluru sering melewati koridor ini.
+    /// </summary>
+    private double ScoreCrossfireDanger(AimPoint point, List<Enemy> threats)
+    {
+        if (threats.Count < 2)
+            return 0.0;
+
+        double danger = 0.0;
+
+        for (int i = 0; i < threats.Count; i++)
+        {
+            for (int j = i + 1; j < threats.Count; j++)
+            {
+                Enemy a = threats[i];
+                Enemy b = threats[j];
+                double enemyDistance = Distance(a.X, a.Y, b.X, b.Y);
+
+                if (enemyDistance < 170.0 || enemyDistance > 1000.0)
+                    continue;
+
+                double segmentDistance = DistanceToSegment(point.X, point.Y, a.X, a.Y, b.X, b.Y, out double t, out _, out _);
+                if (t < 0.08 || t > 0.92 || segmentDistance > CrossfireLineWidth)
+                    continue;
+
+                double lineDanger = 1.0 - segmentDistance / CrossfireLineWidth;
+                double middleDanger = 0.65 + (1.0 - Math.Abs(t - 0.5) * 2.0) * 0.35;
+                double energyWeight = 0.75 + Math.Min(a.Energy + b.Energy, 200.0) / 200.0;
+                double pairDistanceWeight = 0.65 + (1.0 - Math.Min(enemyDistance, 900.0) / 900.0) * 0.35;
+
+                danger += lineDanger * middleDanger * energyWeight * pairDistanceWeight;
+            }
+        }
+
+        return danger;
+    }
+
+    /// <summary>
+    /// Menghasilkan arah keluar dari koridor crossfire terdekat.
+    /// </summary>
+    private double EscapeHeadingFromCrossfire(List<Enemy> threats)
+    {
+        double bestDanger = 0.0;
+        double bestHeading = DirectionTo(ArenaWidth / 2.0, ArenaHeight / 2.0);
+
+        for (int i = 0; i < threats.Count; i++)
+        {
+            for (int j = i + 1; j < threats.Count; j++)
+            {
+                Enemy a = threats[i];
+                Enemy b = threats[j];
+                double enemyDistance = Distance(a.X, a.Y, b.X, b.Y);
+
+                if (enemyDistance < 170.0 || enemyDistance > 1000.0)
+                    continue;
+
+                double segmentDistance = DistanceToSegment(X, Y, a.X, a.Y, b.X, b.Y, out double t, out double closestX, out double closestY);
+                if (t < 0.08 || t > 0.92 || segmentDistance > CrossfireLineWidth * 1.45)
+                    continue;
+
+                double lineDanger = 1.0 - Math.Min(segmentDistance, CrossfireLineWidth * 1.45) / (CrossfireLineWidth * 1.45);
+                double energyWeight = 0.75 + Math.Min(a.Energy + b.Energy, 200.0) / 200.0;
+                double danger = lineDanger * energyWeight;
+
+                if (danger > bestDanger)
+                {
+                    bestDanger = danger;
+                    bestHeading = DirectionBetween(closestX, closestY, X, Y);
+                }
+            }
+        }
+
+        return bestDanger > 0.0 ? bestHeading : EscapeHeadingFromThreatCentroid(threats);
+    }
+
+    /// <summary>
+    /// Bergerak menjauh dari pusat massa musuh agar tidak masuk kerumunan.
+    /// </summary>
+    private double EscapeHeadingFromThreatCentroid(List<Enemy> threats)
+    {
+        double sumX = 0.0;
+        double sumY = 0.0;
+        double totalWeight = 0.0;
+
+        foreach (Enemy enemy in threats)
+        {
+            double distance = Math.Max(60.0, DistanceTo(enemy.X, enemy.Y));
+            double weight = (0.7 + Math.Min(enemy.Energy, 100.0) / 100.0) / distance;
+            sumX += enemy.X * weight;
+            sumY += enemy.Y * weight;
+            totalWeight += weight;
+        }
+
+        if (totalWeight <= 0.0)
+            return DirectionTo(ArenaWidth / 2.0, ArenaHeight / 2.0);
+
+        return NormalizeAbsoluteAngle(DirectionTo(sumX / totalWeight, sumY / totalWeight) + 180.0);
     }
 
     /// <summary>
@@ -955,6 +1079,48 @@ public class TankAlbino : Bot
             x + Math.Cos(radians) * distance,
             y + Math.Sin(radians) * distance
         );
+    }
+
+    /// <summary>
+    /// Menghitung arah absolut dari satu titik ke titik lain.
+    /// </summary>
+    private double DirectionBetween(double fromX, double fromY, double toX, double toY)
+    {
+        return NormalizeAbsoluteAngle(ToDegrees(Math.Atan2(toY - fromY, toX - fromX)));
+    }
+
+    /// <summary>
+    /// Jarak terdekat dari titik ke segmen garis AB, sekaligus titik terdekatnya.
+    /// </summary>
+    private double DistanceToSegment(
+        double px,
+        double py,
+        double ax,
+        double ay,
+        double bx,
+        double by,
+        out double t,
+        out double closestX,
+        out double closestY)
+    {
+        double abx = bx - ax;
+        double aby = by - ay;
+        double lengthSquared = abx * abx + aby * aby;
+
+        if (lengthSquared <= 0.0001)
+        {
+            t = 0.0;
+            closestX = ax;
+            closestY = ay;
+            return Distance(px, py, ax, ay);
+        }
+
+        t = ((px - ax) * abx + (py - ay) * aby) / lengthSquared;
+        t = Limit(t, 0.0, 1.0);
+        closestX = ax + abx * t;
+        closestY = ay + aby * t;
+
+        return Distance(px, py, closestX, closestY);
     }
 
     /// <summary>
