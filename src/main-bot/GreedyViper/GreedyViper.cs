@@ -44,6 +44,15 @@ public class GreedyViper : Bot
     // ID target terakhir yang ditembak (untuk memberikan bonus skor kontinuitas)
     private int lastTargetId = -1;
 
+    // Giliran hingga bot masuk mode panic/evasion setelah terkena tembakan atau flank dekat
+    private int panicUntil = 0;
+
+    // Giliran hingga radar dipaksa sweep untuk mencari musuh samping/belakang
+    private int forcedRadarSweepUntil = 0;
+
+    // Giliran terakhir bot terkena peluru, dipakai untuk memperbesar bobot survival sesaat
+    private int lastBulletHitTurn = -999;
+
     /// <summary>
     /// Entry point program. Membuat instance GreedyViper dan menjalankannya.
     /// </summary>
@@ -154,7 +163,11 @@ public class GreedyViper : Bot
             // Jika energi musuh turun dalam rentang wajar peluru dan jarak dekat,
             // kemungkinan musuh baru menembak — balik orbit untuk menghindar
             if (energyDrop > 0.09 && energyDrop <= 3.1 && enemy.Distance < 700)
+            {
+                panicUntil = Math.Max(panicUntil, TurnNumber + 10);
+                forcedRadarSweepUntil = Math.Max(forcedRadarSweepUntil, TurnNumber + 10);
                 ReverseOrbit();
+            }
 
             enemy.PreviousEnergy = e.Energy;
         }
@@ -166,6 +179,9 @@ public class GreedyViper : Bot
     /// </summary>
     public override void OnHitByBullet(HitByBulletEvent e)
     {
+        lastBulletHitTurn = TurnNumber;
+        panicUntil = Math.Max(panicUntil, TurnNumber + 16);
+        forcedRadarSweepUntil = Math.Max(forcedRadarSweepUntil, TurnNumber + 14);
         ReverseOrbit();
     }
 
@@ -176,6 +192,7 @@ public class GreedyViper : Bot
     public override void OnHitWall(HitWallEvent e)
     {
         forceCenterUntil = TurnNumber + 18;
+        panicUntil = Math.Max(panicUntil, TurnNumber + 8);
         ReverseOrbit();
     }
 
@@ -203,6 +220,7 @@ public class GreedyViper : Bot
         if (!e.IsRammed || e.Energy > 16 || Energy < e.Energy + 10)
         {
             forceCenterUntil = TurnNumber + 12;
+            panicUntil = Math.Max(panicUntil, TurnNumber + 10);
             ReverseOrbit();
         }
         else
@@ -345,6 +363,14 @@ public class GreedyViper : Bot
     /// </summary>
     private void ControlRadar(Enemy target)
     {
+        // Setelah terkena peluru atau melihat musuh menembak, lakukan sweep paksa.
+        // Ini mengurangi blind spot samping/belakang yang sering muncul saat radar terlalu lama lock target.
+        if (TurnNumber < forcedRadarSweepUntil)
+        {
+            RadarTurnRate = radarSign * MaxRadarTurnRate;
+            return;
+        }
+
         // Di melee, radar tidak boleh terlalu lama mengunci satu musuh.
         // Sweep berkala menjaga data musuh belakang/samping tetap segar.
         if (IsMeleeMode() && TurnNumber % 24 < 8)
@@ -490,6 +516,9 @@ public class GreedyViper : Bot
             return;
         }
 
+        Enemy primaryThreat = SelectPrimaryThreat(threats, target);
+        bool panicMode = TurnNumber < panicUntil || IsSideOrBackThreat(primaryThreat, 440.0);
+
         double bestHeading = Direction;
         double bestScore = double.NegativeInfinity;
 
@@ -500,7 +529,29 @@ public class GreedyViper : Bot
         {
             double heading = NormalizeAbsoluteAngle(i * 22.5 + offset);
             AimPoint projected = Project(X, Y, heading, MeleeProjectionDistance);
-            double score = ScoreMeleePosition(projected, heading, target, threats, nearWall);
+            double score = ScoreMeleePosition(projected, heading, target, primaryThreat, threats, nearWall, panicMode);
+
+            if (score > bestScore)
+            {
+                bestScore = score;
+                bestHeading = heading;
+            }
+        }
+
+        // Tambahkan kandidat taktis yang eksplisit keluar dari flank, bukan hanya grid 360 derajat.
+        List<double> tacticalHeadings = new List<double>
+        {
+            NormalizeAbsoluteAngle(DirectionTo(primaryThreat.X, primaryThreat.Y) + 180.0),
+            NormalizeAbsoluteAngle(DirectionTo(primaryThreat.X, primaryThreat.Y) + 90.0 * orbitSign),
+            NormalizeAbsoluteAngle(DirectionTo(primaryThreat.X, primaryThreat.Y) - 90.0 * orbitSign),
+            DirectionTo(ArenaWidth / 2.0, ArenaHeight / 2.0),
+            EscapeHeadingFromThreatCentroid(threats)
+        };
+
+        foreach (double heading in tacticalHeadings)
+        {
+            AimPoint projected = Project(X, Y, heading, MeleeProjectionDistance);
+            double score = ScoreMeleePosition(projected, heading, target, primaryThreat, threats, nearWall, panicMode);
 
             if (score > bestScore)
             {
@@ -510,10 +561,12 @@ public class GreedyViper : Bot
         }
 
         double speedFactor = nearWall ? 0.78 : 1.0;
+        if (panicMode)
+            speedFactor = Math.Min(speedFactor, 0.88);
         if (targetDistance < 130 && !ShouldRam(target, targetDistance))
             speedFactor = 0.72;
 
-        MoveToward(bestHeading, speedFactor);
+        MoveToward(bestHeading, speedFactor, primaryThreat, threats);
     }
 
     /// <summary>
@@ -521,7 +574,14 @@ public class GreedyViper : Bot
     /// dengan jarak aman dari dinding, jauh dari musuh terdekat, tidak masuk kerumunan,
     /// dan tetap bergerak lateral terhadap target tembak.
     /// </summary>
-    private double ScoreMeleePosition(AimPoint point, double moveHeading, Enemy target, List<Enemy> threats, bool nearWall)
+    private double ScoreMeleePosition(
+        AimPoint point,
+        double moveHeading,
+        Enemy target,
+        Enemy primaryThreat,
+        List<Enemy> threats,
+        bool nearWall,
+        bool panicMode)
     {
         if (point.X < 18 || point.Y < 18 || point.X > ArenaWidth - 18 || point.Y > ArenaHeight - 18)
             return -1000000.0;
@@ -536,10 +596,13 @@ public class GreedyViper : Bot
         double averageDistance = 0.0;
         double closePenalty = 0.0;
         double lateralTotal = 0.0;
+        double sideBackPenalty = 0.0;
+        double worstThreatPenalty = 0.0;
 
         foreach (Enemy enemy in threats)
         {
             double distance = Distance(point.X, point.Y, enemy.X, enemy.Y);
+            double currentDistance = Distance(X, Y, enemy.X, enemy.Y);
             nearestDistance = Math.Min(nearestDistance, distance);
             averageDistance += Math.Min(distance, 900.0);
 
@@ -548,6 +611,23 @@ public class GreedyViper : Bot
 
             double enemyDirection = DirectionTo(enemy.X, enemy.Y);
             lateralTotal += Math.Abs(Math.Sin(ToRadians(NormalizeRelativeAngle(moveHeading - enemyDirection))));
+
+            double bearingFromBody = Math.Abs(NormalizeRelativeAngle(enemyDirection - Direction));
+            bool sideOrBack = bearingFromBody > 70.0;
+            bool primary = enemy.Id == primaryThreat.Id;
+            double closeFactor = 1.0 - Math.Min(currentDistance, 700.0) / 700.0;
+            double projectedCloseFactor = 1.0 - Math.Min(distance, 620.0) / 620.0;
+            double energyFactor = 0.65 + Math.Min(enemy.Energy, 100.0) / 100.0;
+            double movingCloserPenalty = distance < currentDistance ? (currentDistance - distance) / 90.0 : 0.0;
+            double flankMultiplier = sideOrBack ? 1.65 : 0.75;
+            if (primary)
+                flankMultiplier += 0.95;
+
+            sideBackPenalty += projectedCloseFactor * energyFactor * flankMultiplier
+                + movingCloserPenalty * (sideOrBack ? 1.25 : 0.45);
+
+            double threatValue = projectedCloseFactor * energyFactor * flankMultiplier;
+            worstThreatPenalty = Math.Max(worstThreatPenalty, threatValue);
         }
 
         averageDistance /= threats.Count;
@@ -563,13 +643,98 @@ public class GreedyViper : Bot
         double maxCenterDistance = Distance(0, 0, ArenaWidth / 2.0, ArenaHeight / 2.0);
         double centerScore = 1.0 - Math.Min(centerDistance / maxCenterDistance, 1.0);
 
+        double primaryCurrentDistance = Distance(X, Y, primaryThreat.X, primaryThreat.Y);
+        double primaryProjectedDistance = Distance(point.X, point.Y, primaryThreat.X, primaryThreat.Y);
+        double primaryEscapeScore = Limit((primaryProjectedDistance - primaryCurrentDistance) / 150.0, -1.2, 1.8);
+        double primaryDirection = DirectionTo(primaryThreat.X, primaryThreat.Y);
+        double primaryLateralScore = Math.Abs(Math.Sin(ToRadians(NormalizeRelativeAngle(moveHeading - primaryDirection))));
+        double panicMultiplier = panicMode ? 1.65 : 1.0;
+
         return wallScore
             + nearestScore * 2.4
             + averageScore * 1.25
             + lateralScore * 1.35
+            + primaryLateralScore * 1.15 * panicMultiplier
+            + primaryEscapeScore * 1.7 * panicMultiplier
             + targetDistanceScore * 0.85
             + centerScore * 0.45
-            - closePenalty * 2.7;
+            - closePenalty * 2.7
+            - sideBackPenalty * 1.55 * panicMultiplier
+            - worstThreatPenalty * 1.85 * panicMultiplier;
+    }
+
+    /// <summary>
+    /// Memilih musuh yang paling berbahaya bagi survival saat ini.
+    /// Ini dipakai movement agar bot tidak hanya bereaksi terhadap target tembak utama.
+    /// </summary>
+    private Enemy SelectPrimaryThreat(List<Enemy> threats, Enemy target)
+    {
+        Enemy best = target;
+        double bestScore = double.NegativeInfinity;
+
+        foreach (Enemy enemy in threats)
+        {
+            double distance = DistanceTo(enemy.X, enemy.Y);
+            double bearingFromBody = Math.Abs(NormalizeRelativeAngle(DirectionTo(enemy.X, enemy.Y) - Direction));
+            double closeFactor = 1.0 - Math.Min(distance, 760.0) / 760.0;
+            double energyFactor = 0.6 + Math.Min(enemy.Energy, 100.0) / 100.0;
+            double sideBonus = bearingFromBody > 70.0 ? 1.35 : 0.0;
+            double backBonus = bearingFromBody > 135.0 ? 1.15 : 0.0;
+            double targetPenalty = enemy.Id == target.Id ? 0.35 : 0.0;
+            double agePenalty = Math.Max(0, TurnNumber - enemy.LastSeen) * 0.08;
+
+            double score = closeFactor * (2.0 + energyFactor + sideBonus + backBonus)
+                + (distance < 180.0 ? 2.0 : 0.0)
+                - targetPenalty
+                - agePenalty;
+
+            if (score > bestScore)
+            {
+                bestScore = score;
+                best = enemy;
+            }
+        }
+
+        return best;
+    }
+
+    /// <summary>
+    /// Mengecek apakah ancaman berada pada sektor samping/belakang yang cukup dekat.
+    /// </summary>
+    private bool IsSideOrBackThreat(Enemy enemy, double maxDistance)
+    {
+        double distance = DistanceTo(enemy.X, enemy.Y);
+        double bearingFromBody = Math.Abs(NormalizeRelativeAngle(DirectionTo(enemy.X, enemy.Y) - Direction));
+
+        return distance <= maxDistance && bearingFromBody > 70.0;
+    }
+
+    /// <summary>
+    /// Menghasilkan heading menjauh dari pusat massa musuh yang masih terlihat.
+    /// Berguna saat bot terjepit oleh beberapa musuh sekaligus.
+    /// </summary>
+    private double EscapeHeadingFromThreatCentroid(List<Enemy> threats)
+    {
+        double sumX = 0.0;
+        double sumY = 0.0;
+        double totalWeight = 0.0;
+
+        foreach (Enemy enemy in threats)
+        {
+            double distance = Math.Max(60.0, DistanceTo(enemy.X, enemy.Y));
+            double weight = (0.7 + Math.Min(enemy.Energy, 100.0) / 100.0) / distance;
+            sumX += enemy.X * weight;
+            sumY += enemy.Y * weight;
+            totalWeight += weight;
+        }
+
+        if (totalWeight <= 0.0)
+            return DirectionTo(ArenaWidth / 2.0, ArenaHeight / 2.0);
+
+        double centroidX = sumX / totalWeight;
+        double centroidY = sumY / totalWeight;
+
+        return NormalizeAbsoluteAngle(DirectionTo(centroidX, centroidY) + 180.0);
     }
 
     /// <summary>
@@ -578,17 +743,71 @@ public class GreedyViper : Bot
     /// </summary>
     private void MoveToward(double moveHeading, double speedFactor)
     {
+        MoveToward(moveHeading, speedFactor, null, null);
+    }
+
+    /// <summary>
+    /// Varian aman dari MoveToward. Saat ada ancaman belakang, bot menghindari
+    /// keputusan mundur jika proyeksi mundurnya justru makin dekat ke musuh.
+    /// </summary>
+    private void MoveToward(double moveHeading, double speedFactor, Enemy? primaryThreat, List<Enemy>? threats)
+    {
         double turn = NormalizeRelativeAngle(moveHeading - Direction);
         double speed = MaxSpeed * Limit(speedFactor, 0.0, 1.0);
 
         if (Math.Abs(turn) > 100.0)
         {
-            turn = NormalizeRelativeAngle(turn + 180.0);
-            speed = -speed;
+            if (IsReverseUnsafe(primaryThreat, threats))
+            {
+                // Tetap maju pelan sambil memutar badan, agar tidak mundur ke penyerang belakang.
+                speed *= 0.48;
+            }
+            else
+            {
+                turn = NormalizeRelativeAngle(turn + 180.0);
+                speed = -speed;
+            }
         }
 
         TurnRate = Limit(turn, -MaxTurnRate, MaxTurnRate);
         TargetSpeed = speed;
+    }
+
+    /// <summary>
+    /// Mengevaluasi apakah gerak mundur berisiko mendekati musuh samping/belakang.
+    /// </summary>
+    private bool IsReverseUnsafe(Enemy? primaryThreat, List<Enemy>? threats)
+    {
+        double reverseHeading = NormalizeAbsoluteAngle(Direction + 180.0);
+        AimPoint projected = Project(X, Y, reverseHeading, MeleeProjectionDistance * 0.75);
+
+        if (OutsideSafeArea(projected.X, projected.Y))
+            return true;
+
+        if (primaryThreat != null)
+        {
+            double currentDistance = DistanceTo(primaryThreat.X, primaryThreat.Y);
+            double projectedDistance = Distance(projected.X, projected.Y, primaryThreat.X, primaryThreat.Y);
+            double bearingFromBody = Math.Abs(NormalizeRelativeAngle(DirectionTo(primaryThreat.X, primaryThreat.Y) - Direction));
+
+            if (bearingFromBody > 95.0 && projectedDistance < currentDistance + 12.0 && projectedDistance < 330.0)
+                return true;
+        }
+
+        if (threats == null)
+            return false;
+
+        foreach (Enemy enemy in threats)
+        {
+            double currentDistance = DistanceTo(enemy.X, enemy.Y);
+            double projectedDistance = Distance(projected.X, projected.Y, enemy.X, enemy.Y);
+            double bearingFromBody = Math.Abs(NormalizeRelativeAngle(DirectionTo(enemy.X, enemy.Y) - Direction));
+
+            if (bearingFromBody > 75.0 && projectedDistance < currentDistance && projectedDistance < 260.0)
+                return true;
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -810,6 +1029,9 @@ public class GreedyViper : Bot
         lastReverseTurn = -999;
         forceCenterUntil = 0;
         lastTargetId = -1;
+        panicUntil = 0;
+        forcedRadarSweepUntil = 0;
+        lastBulletHitTurn = -999;
     }
 
     /// <summary>
