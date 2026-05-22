@@ -4,13 +4,17 @@ using System.Drawing;
 using Robocode.TankRoyale.BotApi;
 using Robocode.TankRoyale.BotApi.Events;
 
-public class GreedyRammer : Bot
+public class BantengMerah : Bot
 {
     // ── Jarak aman dari dinding sebelum bot menghindarinya ──────────
     private const double WALL_MARGIN = 80.0;
 
-    // ── Jarak point-blank: hit chance sangat tinggi ──────────────────
-    private const double CLOSE_RANGE = 10.0;
+    // ── Jarak RAM aktif: bot mulai menekan dan tidak zigzag ─────────
+    // [PERBAIKAN] Dinaikkan dari 10 → 120 agar ramming dimulai lebih awal
+    private const double RAM_ENGAGE_RANGE = 120.0;
+
+    // ── Jarak point-blank: bot sudah bersentuhan / hampir ───────────
+    private const double CLOSE_RANGE = 30.0;
 
     // ── Jarak menengah: batas antara peluru berat/ringan ────────────
     private const double MEDIUM_RANGE = 350.0;
@@ -33,46 +37,26 @@ public class GreedyRammer : Bot
     // ── Sudut lateral zig-zag dari arah ke target (derajat) ─────────
     private const double ZIGZAG_ANGLE = 30.0;
 
-    // ── Dictionary semua musuh yang terdeteksi radar ─────────────────
+    // ── Berapa turn setelah tabrakan bot terus mendorong (ram sustain)
+    private const int RAM_SUSTAIN_TURNS = 8;
+
     private readonly Dictionary<int, EnemyInfo> _enemies = new();
-
-    // ── Target greedy saat ini (musuh terdekat) ──────────────────────
     private EnemyInfo? _target;
-
-    // ── Arah sweep radar: +1 kiri, -1 kanan, bergantian ─────────────
-    private int _radarSweepDir = 1;
-
-    // ── Turn terakhir sweep penuh dilakukan ──────────────────────────
-    private int _lastSweepTurn = 0;
-
-    // ── Flag: apakah sedang dalam mode sweep penuh ───────────────────
-    private bool _sweeping = true;
-
-    // ── Berapa derajat radar sudah berputar dalam sweep saat ini ─────
+    private int    _radarSweepDir    = 1;
+    private int    _lastSweepTurn    = 0;
+    private bool   _sweeping         = true;
     private double _sweepAccumulated = 0.0;
+    private double _lastRadarDir     = 0.0;
+    private int    _zigzagDir        = 1;
+    private int    _zigzagCounter    = 0;
+    private readonly Random _rng     = new();
+    private int    _zigzagPhaseLimit = ZIGZAG_PHASE_TURNS;
+    private bool   _isRamming        = false;
+    private int    _ramSustainCounter = 0;
 
-    // ── Arah radar turn sebelumnya untuk menghitung akumulasi sweep ──
-    private double _lastRadarDir = 0.0;
+    static void Main(string[] args) => new BantengMerah().Start();
+    BantengMerah() : base(BotInfo.FromFile("BantengMerah.json")) { }
 
-    // ── Arah lateral zig-zag saat ini: +1 = kiri target, -1 = kanan ─
-    private int _zigzagDir = 1;
-
-    // ── Counter turn dalam fase zig-zag saat ini ─────────────────────
-    private int _zigzagCounter = 0;
-
-    // ── RNG untuk variasi timing zig-zag agar tidak terpola ──────────
-    private readonly Random _rng = new();
-
-    // ── Batas turn fase zig-zag saat ini (acak tiap fase) ───────────
-    private int _zigzagPhaseLimit = ZIGZAG_PHASE_TURNS;
-
-    // ── Entry point ──────────────────────────────────────────────────
-    static void Main(string[] args) => new GreedyRammer().Start();
-    GreedyRammer() : base(BotInfo.FromFile("GreedyRammer.json")) { }
-
-    // ═══════════════════════════════════════════════════════════
-    // RUN — Loop utama bot
-    // ═══════════════════════════════════════════════════════════
     public override void Run()
     {
         AdjustGunForBodyTurn   = true;
@@ -93,12 +77,15 @@ public class GreedyRammer : Bot
 
             if (HasFreshTarget())
             {
-                ExecuteRamChaseZigzag(_target!);
+                // Tembak dulu agar gun mulai rotate sebelum badan bergerak
                 ExecuteRamFire(_target!);
+                ExecuteRamChase(_target!);
             }
             else
             {
-                _target = null;
+                _target            = null;
+                _isRamming         = false;
+                _ramSustainCounter = 0;
                 ExecuteSearchPattern();
             }
 
@@ -107,16 +94,7 @@ public class GreedyRammer : Bot
     }
 
     // ═══════════════════════════════════════════════════════════
-    // EXECUTE RADAR CONTROL — Otak sistem radar
-    //
-    // Fase 1 — SWEEP PENUH:
-    //   Radar berputar 360° penuh untuk mendeteksi semua musuh.
-    //   Dilakukan saat awal, setiap SWEEP_INTERVAL turn,
-    //   setelah target mati, atau setelah nabrak dinding.
-    //
-    // Fase 2 — LOCK KE TARGET:
-    //   Radar dikunci ke target terdekat dengan overshoot
-    //   agar tidak kehilangan tracking saat target bergerak.
+    // EXECUTE RADAR CONTROL
     // ═══════════════════════════════════════════════════════════
     private void ExecuteRadarControl()
     {
@@ -146,8 +124,7 @@ public class GreedyRammer : Bot
         {
             double radarBearing = RadarBearingTo(_target.X, _target.Y);
             double overshoot    = radarBearing >= 0 ? 22 : -22;
-            if (_target.Speed > 4)
-                overshoot *= 1.5;
+            if (_target.Speed > 4) overshoot *= 1.5;
             SetTurnRadarLeft(radarBearing + overshoot);
         }
         else
@@ -158,17 +135,21 @@ public class GreedyRammer : Bot
     }
 
     // ═══════════════════════════════════════════════════════════
-    // EXECUTE RAM CHASE ZIGZAG — Kejar target dengan pola zig-zag
+    // EXECUTE RAM CHASE — Kejar dan seruduk target
     //
-    // Saat mengejar, bot bergerak zig-zag agar sulit ditembak.
-    // Saat sudah dekat (< CLOSE_RANGE), langsung seruduk lurus.
+    // [PERBAIKAN]
+    // - RAM_ENGAGE_RANGE dinaikkan: mulai ram lebih awal (jarak 120)
+    // - SetForward pakai overshoot besar agar bot terus mendorong
+    //   menembus posisi musuh, bukan berhenti tepat di sana
+    // - _ramSustainCounter mempertahankan momentum ram setelah HitBot
     // ═══════════════════════════════════════════════════════════
-    private void ExecuteRamChaseZigzag(EnemyInfo target)
+    private void ExecuteRamChase(EnemyInfo target)
     {
         if (IsNearWall())
         {
-            double centerBearing = BearingTo(ArenaWidth / 2.0, ArenaHeight / 2.0);
-            SetTurnLeft(centerBearing);
+            _isRamming         = false;
+            _ramSustainCounter = 0;
+            SetTurnLeft(BearingTo(ArenaWidth / 2.0, ArenaHeight / 2.0));
             SetForward(200);
             TargetSpeed    = 8;
             _zigzagCounter = 0;
@@ -178,17 +159,23 @@ public class GreedyRammer : Bot
         double distance        = DistanceTo(target.X, target.Y);
         double bearingToTarget = BearingTo(target.X, target.Y);
 
-        if (distance < CLOSE_RANGE)
+        if (_ramSustainCounter > 0) _ramSustainCounter--;
+
+        bool shouldRam = distance <= RAM_ENGAGE_RANGE || _ramSustainCounter > 0;
+
+        if (shouldRam)
         {
-            // Fase RAM: sudah dekat → lurus penuh ke target
+            // MODE RAM: tancap gas lurus, overshoot besar agar
+            // bot tidak berhenti dan terus mendorong musuh
+            _isRamming = true;
             SetTurnLeft(bearingToTarget);
-            SetForward(distance + 100);
+            SetForward(distance + 300);
             TargetSpeed    = 8;
             _zigzagCounter = 0;
         }
         else
         {
-            // Fase ZIG-ZAG: masih jauh → zig-zag sambil mendekat
+            _isRamming = false;
             _zigzagCounter++;
             if (_zigzagCounter >= _zigzagPhaseLimit)
             {
@@ -205,83 +192,77 @@ public class GreedyRammer : Bot
     }
 
     // ═══════════════════════════════════════════════════════════
-    // EXECUTE RAM FIRE — Tembak sambil mengejar
+    // EXECUTE RAM FIRE — Tembak seakurat mungkin saat mengejar
     //
-    // PERBAIKAN dari versi sebelumnya:
+    // PERBAIKAN:
     //
-    // 1. Prediksi posisi musuh saat peluru tiba (linear prediction)
-    //    Tanpa prediksi, gun selalu tertinggal saat musuh berlari.
-    //    Gun diarahkan ke posisi prediksi, bukan posisi saat ini.
+    // 1. FIX BUG TRIGONOMETRI PREDIKSI (kritis):
+    //    TankRoyale: 0°=North, clockwise.
+    //    vX = sin(direction) * speed  → Math.Sin untuk X  [DIFIX]
+    //    vY = cos(direction) * speed  → Math.Cos untuk Y  [DIFIX]
+    //    Versi lama TERBALIK → prediksi meleset saat musuh bergerak.
     //
-    // 2. Firepower berbasis jarak, bukan threshold hitChance:
-    //    - Kritis (energi < 15)   → fp 1.0 saja (hemat energi)
-    //    - Jarak dekat (< 120)    → fp 2.5-3.0 (damage maksimal)
-    //    - Jarak menengah (< 350) → fp 1.5-2.5 (seimbang)
-    //    - Jarak jauh (≥ 350)     → fp 1.0-1.5 (peluru cepat agar
-    //                               bisa mengejar musuh yang lari)
+    // 2. Iterasi prediksi: 3 → 5 untuk konvergensi lebih akurat.
     //
-    // 3. Threshold hitChance diturunkan menjadi 0.10 (dari 0.25)
-    //    Saat musuh lari, sedikit tembakan tetap lebih baik daripada
-    //    tidak menembak sama sekali dan mati tanpa melawan.
+    // 3. Setelah fp terpilih, prediksi diulang dengan bulletSpeed
+    //    yang benar-benar akan dipakai (bukan estimasi awal).
     //
-    // 4. Fallback minimum fire: jika semua opsi gagal scoring tapi
-    //    gun sudah cukup lurus (< 15°), tetap tembak fp 1.0 agar
-    //    bot tidak pernah diam sepenuhnya saat dikejar.
+    // 4. Threshold aim adaptif:
+    //    - RAM aktif : 30° (dekat, sedikit offset tetap kena)
+    //    - Jarak < 200: 15°
+    //    - Jauh       : 8° (ketat, hemat energi)
+    //
+    // 5. hitChance minimum diturunkan ke 0.05 saat ram mode.
     // ═══════════════════════════════════════════════════════════
     private void ExecuteRamFire(EnemyInfo target)
     {
         if (GunHeat != 0) return;
         if (Energy   < 1.0) return;
 
-        // ── Prediksi posisi musuh saat peluru tiba ───────────────────
-        // Iterasi 3x hingga travelTime konvergen dengan jarak prediksi
+        double distance = DistanceTo(target.X, target.Y);
+
+        // Estimasi fp awal untuk iterasi prediksi
+        double estFp = Energy < ENERGY_CRITICAL ? 1.0 :
+                       _isRamming              ? 3.0 :
+                       distance < MEDIUM_RANGE ? 2.0 : 1.5;
+
+        // Prediksi posisi musuh saat peluru tiba
+        // [FIX KRITIS] Sin untuk X, Cos untuk Y (sistem TankRoyale)
         double predX = target.X;
         double predY = target.Y;
-        // Gunakan fp 1.5 sebagai estimasi awal untuk prediksi posisi
-        double estFp = Energy < ENERGY_CRITICAL ? 1.0 : 1.5;
-        for (int i = 0; i < 3; i++)
+        for (int i = 0; i < 5; i++)
         {
             double bulletSpeed = CalcBulletSpeed(estFp);
             double dist        = DistanceTo(predX, predY);
             double travelTime  = dist / bulletSpeed;
             double rad         = target.Direction * Math.PI / 180.0;
-            predX = target.X + Math.Cos(rad) * target.Speed * travelTime;
-            predY = target.Y + Math.Sin(rad) * target.Speed * travelTime;
 
-            // Clamp agar prediksi tidak keluar arena
+            predX = target.X + Math.Sin(rad) * target.Speed * travelTime;
+            predY = target.Y + Math.Cos(rad) * target.Speed * travelTime;
+
             predX = Math.Clamp(predX, WALL_MARGIN, ArenaWidth  - WALL_MARGIN);
             predY = Math.Clamp(predY, WALL_MARGIN, ArenaHeight - WALL_MARGIN);
         }
 
-        // Arahkan gun ke posisi prediksi (bukan posisi saat ini)
         double gunBearing    = GunBearingTo(predX, predY);
         double absGunBearing = Math.Abs(gunBearing);
         SetTurnGunLeft(gunBearing);
 
-        double distance = DistanceTo(target.X, target.Y);
+        // Threshold aim adaptif
+        double aimThreshold = _isRamming      ? 30.0 :
+                              distance < 200  ? 15.0 : 8.0;
+        if (absGunBearing > aimThreshold) return;
 
-        // ── Tentukan opsi firepower berdasarkan jarak & energi ───────
+        // Pilih firepower
         double[] fireOptions;
         if (Energy < ENERGY_CRITICAL)
-        {
-            // Energi kritis: hemat, hanya tembak ringan
             fireOptions = new[] { 1.0 };
-        }
-        else if (distance < CLOSE_RANGE)
-        {
-            // Point-blank: peluru berat untuk damage + ram combo
+        else if (_isRamming || distance < CLOSE_RANGE)
             fireOptions = new[] { 2.5, 3.0 };
-        }
         else if (distance < MEDIUM_RANGE)
-        {
-            // Jarak menengah: seimbang antara kecepatan dan damage
             fireOptions = new[] { 1.5, 2.0, 2.5 };
-        }
         else
-        {
-            // Jarak jauh / musuh lari: peluru ringan lebih cepat sampai
             fireOptions = new[] { 1.0, 1.5 };
-        }
 
         double bestScore = double.NegativeInfinity;
         double bestFp    = -1;
@@ -290,40 +271,44 @@ public class GreedyRammer : Bot
         {
             if (Energy <= fp + 0.2) continue;
 
-            double hitChance = EstimateHitChance(distance, absGunBearing, target.Speed, fp);
+            double hitChance    = EstimateHitChance(distance, absGunBearing, target.Speed, fp);
+            double minHitChance = _isRamming ? 0.05 : 0.10;
+            if (hitChance < minHitChance) continue;
 
-            // Threshold diturunkan ke 0.10 agar tetap tembak saat musuh
-            // menjauh — lebih baik tembak dengan peluang kecil daripada
-            // tidak tembak sama sekali dan terus menerima damage gratis
-            if (hitChance < 0.10) continue;
-
-            double damage       = 4.0 * fp + (fp > 1 ? 2.0 * (fp - 1) : 0);
+            double damage        = 4.0 * fp + (fp > 1 ? 2.0 * (fp - 1) : 0);
             double energyPenalty = fp * (Energy < ENERGY_CRITICAL ? 2.0 : 1.0);
-            double score        = damage * hitChance - energyPenalty;
+            double score         = damage * hitChance - energyPenalty;
 
-            if (score > bestScore)
-            {
-                bestScore = score;
-                bestFp    = fp;
-            }
+            if (score > bestScore) { bestScore = score; bestFp = fp; }
         }
 
         if (bestFp > 0)
         {
+            // Prediksi ulang dengan fp aktual untuk akurasi final
+            double finalPredX = target.X;
+            double finalPredY = target.Y;
+            for (int i = 0; i < 3; i++)
+            {
+                double bs  = CalcBulletSpeed(bestFp);
+                double d   = DistanceTo(finalPredX, finalPredY);
+                double tt  = d / bs;
+                double r   = target.Direction * Math.PI / 180.0;
+                finalPredX = target.X + Math.Sin(r) * target.Speed * tt;
+                finalPredY = target.Y + Math.Cos(r) * target.Speed * tt;
+                finalPredX = Math.Clamp(finalPredX, WALL_MARGIN, ArenaWidth  - WALL_MARGIN);
+                finalPredY = Math.Clamp(finalPredY, WALL_MARGIN, ArenaHeight - WALL_MARGIN);
+            }
+            SetTurnGunLeft(GunBearingTo(finalPredX, finalPredY));
             SetFire(bestFp);
         }
-        else if (absGunBearing < 15.0 && Energy > 1.2)
+        else if (absGunBearing < 20.0 && Energy > 1.2)
         {
-            // ── Fallback minimum fire ────────────────────────────────
-            // Semua opsi gagal threshold, tapi gun sudah cukup lurus.
-            // Tembak peluru ringan agar bot tidak diam tanpa melawan
-            // saat musuh terus menembaki kita dari kejauhan.
             SetFire(Math.Min(1.0, Energy - 0.2));
         }
     }
 
     // ═══════════════════════════════════════════════════════════
-    // ESTIMATE HIT CHANCE — Estimasi peluang peluru mengenai target
+    // ESTIMATE HIT CHANCE
     // ═══════════════════════════════════════════════════════════
     private static double EstimateHitChance(
         double distance, double gunOffset, double enemySpeed, double fp)
@@ -336,7 +321,12 @@ public class GreedyRammer : Bot
     }
 
     // ═══════════════════════════════════════════════════════════
-    // EXECUTE SEARCH PATTERN — Gerak saat tidak ada target
+    // CALC BULLET SPEED
+    // ═══════════════════════════════════════════════════════════
+    private static double CalcBulletSpeed(double fp) => 20.0 - 3.0 * fp;
+
+    // ═══════════════════════════════════════════════════════════
+    // EXECUTE SEARCH PATTERN
     // ═══════════════════════════════════════════════════════════
     private void ExecuteSearchPattern()
     {
@@ -349,7 +339,7 @@ public class GreedyRammer : Bot
     }
 
     // ═══════════════════════════════════════════════════════════
-    // ON SCANNED BOT — Update data musuh dan pilih target
+    // ON SCANNED BOT
     // ═══════════════════════════════════════════════════════════
     public override void OnScannedBot(ScannedBotEvent e)
     {
@@ -367,30 +357,39 @@ public class GreedyRammer : Bot
 
     // ═══════════════════════════════════════════════════════════
     // ON HIT BOT — Berhasil menabrak bot musuh
+    //
+    // [PERBAIKAN] Tidak mundur. Set _ramSustainCounter agar
+    // loop utama terus mendorong selama RAM_SUSTAIN_TURNS turn.
     // ═══════════════════════════════════════════════════════════
     public override void OnHitBot(HitBotEvent e)
     {
         if (GunHeat == 0 && Energy > MAX_FIREPOWER + 0.1)
             SetFire(MAX_FIREPOWER);
 
-        _zigzagCounter    = 0;
-        _zigzagPhaseLimit = ZIGZAG_PHASE_TURNS;
+        _ramSustainCounter = RAM_SUSTAIN_TURNS;
+        _isRamming         = true;
+        _zigzagCounter     = 0;
+        _zigzagPhaseLimit  = ZIGZAG_PHASE_TURNS;
 
-        SetForward(150);
+        // Terus mendorong maju
+        SetForward(250);
         TargetSpeed = 8;
         Go();
     }
 
     // ═══════════════════════════════════════════════════════════
-    // ON HIT BY BULLET — Kena tembakan
+    // ON HIT BY BULLET
     // ═══════════════════════════════════════════════════════════
     public override void OnHitByBullet(HitByBulletEvent e)
     {
-        _zigzagDir        *= -1;
-        _zigzagCounter     = 0;
-        _zigzagPhaseLimit  = _rng.Next(6, 13);
+        if (!_isRamming)
+        {
+            _zigzagDir       *= -1;
+            _zigzagCounter    = 0;
+            _zigzagPhaseLimit = _rng.Next(6, 13);
+        }
 
-        if (Energy < ENERGY_CRITICAL)
+        if (Energy < ENERGY_CRITICAL && !_isRamming)
         {
             SetBack(80);
             TargetSpeed = -4;
@@ -399,10 +398,12 @@ public class GreedyRammer : Bot
     }
 
     // ═══════════════════════════════════════════════════════════
-    // ON HIT WALL — Menabrak dinding
+    // ON HIT WALL
     // ═══════════════════════════════════════════════════════════
     public override void OnHitWall(HitWallEvent e)
     {
+        _isRamming         = false;
+        _ramSustainCounter = 0;
         SetBack(80);
         SetTurnLeft(BearingTo(ArenaWidth / 2.0, ArenaHeight / 2.0));
         _sweeping         = true;
@@ -413,23 +414,23 @@ public class GreedyRammer : Bot
     }
 
     // ═══════════════════════════════════════════════════════════
-    // ON BOT DEATH — Musuh mati
+    // ON BOT DEATH
     // ═══════════════════════════════════════════════════════════
     public override void OnBotDeath(BotDeathEvent e)
     {
         _enemies.Remove(e.VictimId);
         if (_target != null && _target.Id == e.VictimId)
         {
-            _target           = null;
-            _sweeping         = true;
-            _sweepAccumulated = 0.0;
+            _target            = null;
+            _isRamming         = false;
+            _ramSustainCounter = 0;
+            _sweeping          = true;
+            _sweepAccumulated  = 0.0;
         }
     }
 
     // ═══════════════════════════════════════════════════════════
-    // SELECT CLOSEST TARGET — Fungsi seleksi greedy utama
-    //
-    // Memilih musuh dengan jarak terkecil sebagai target.
+    // SELECT CLOSEST TARGET
     // ═══════════════════════════════════════════════════════════
     private void SelectClosestTarget()
     {
@@ -452,24 +453,15 @@ public class GreedyRammer : Bot
         _target = closest;
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // HAS FRESH TARGET — Cek apakah target masih valid dan segar
-    // ═══════════════════════════════════════════════════════════
     private bool HasFreshTarget() =>
         _target is not null && TurnNumber - _target.LastSeenTurn <= STALE_THRESHOLD;
 
-    // ═══════════════════════════════════════════════════════════
-    // IS NEAR WALL — Cek apakah bot mendekati batas arena
-    // ═══════════════════════════════════════════════════════════
     private bool IsNearWall() =>
         X < WALL_MARGIN || Y < WALL_MARGIN ||
         X > ArenaWidth  - WALL_MARGIN ||
         Y > ArenaHeight - WALL_MARGIN;
 }
 
-// ═══════════════════════════════════════════════════════════════
-// ENEMY INFO — Data class informasi musuh
-// ═══════════════════════════════════════════════════════════════
 internal record EnemyInfo(
     int    Id,
     double X,
