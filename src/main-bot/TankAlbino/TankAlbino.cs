@@ -82,7 +82,7 @@ public class TankAlbino : Bot
     /// </summary>
     public TankAlbino() : base(new BotInfo(
         "TankAlbino",
-        "1.0",
+        "1.8",
         new List<string> { "Ayam Gak Jago" },
         "Greedy score hunter with predictive firing and orbit evasion.",
         null,
