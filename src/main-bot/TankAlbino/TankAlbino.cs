@@ -5,11 +5,11 @@ using System.Drawing;
 using Robocode.TankRoyale.BotApi.Events;
 
 /// <summary>
-/// GreedyViper — bot tank berbasis strategi "greedy" yang memilih target berdasarkan
+/// TankAlbino — bot tank berbasis strategi "greedy" yang memilih target berdasarkan
 /// skor keuntungan tertinggi per giliran. Menggabungkan radar berputar, prediksi posisi
 /// musuh, orbit menghindar, dan keputusan menembak adaptif.
 /// </summary>
-public class GreedyViper : Bot
+public class TankAlbino : Bot
 {
     // Jarak minimum dari dinding agar bot dianggap "aman" dari tabrakan dinding
     private const double WallMargin = 72.0;
@@ -23,11 +23,23 @@ public class GreedyViper : Bot
     // Jarak proyeksi untuk menilai apakah arah gerak berikutnya aman atau tidak
     private const double MeleeProjectionDistance = 145.0;
 
+    // Jarak proyeksi kandidat gerak saat duel 1v1 melawan tembakan presisi
+    private const double DuelProjectionDistance = 165.0;
+
+    // Jumlah wave peluru musuh yang disimpan agar evaluasi tetap ringan
+    private const int MaxEnemyWaves = 10;
+
     // Lock untuk akses thread-safe ke kamus enemies (karena event berjalan di thread lain)
     private readonly object enemyLock = new object();
 
+    // Lock untuk wave peluru musuh yang juga diperbarui dari event scan
+    private readonly object waveLock = new object();
+
     // Menyimpan data semua musuh yang pernah terdeteksi, diindeks oleh ID bot
     private readonly Dictionary<int, Enemy> enemies = new Dictionary<int, Enemy>();
+
+    // Wave peluru musuh hasil deteksi energy drop. Dipakai untuk movement 1v1.
+    private readonly List<EnemyBulletWave> enemyWaves = new List<EnemyBulletWave>();
 
     // Arah putaran orbit: +1 (berlawanan jarum jam) atau -1 (searah jarum jam)
     private int orbitSign = 1;
@@ -53,20 +65,23 @@ public class GreedyViper : Bot
     // Giliran terakhir bot terkena peluru, dipakai untuk memperbesar bobot survival sesaat
     private int lastBulletHitTurn = -999;
 
+    // Giliran hingga bot sengaja mengubah velocity setelah musuh terdeteksi menembak
+    private int duelJinkUntil = 0;
+
     /// <summary>
-    /// Entry point program. Membuat instance GreedyViper dan menjalankannya.
+    /// Entry point program. Membuat instance TankAlbino dan menjalankannya.
     /// </summary>
     static void Main(string[] args)
     {
-        new GreedyViper().Start();
+        new TankAlbino().Start();
     }
 
     /// <summary>
     /// Konstruktor: mendaftarkan metadata bot ke sistem Robocode Tank Royale
     /// (nama, versi, penulis, deskripsi, bahasa, kategori, dll).
     /// </summary>
-    public GreedyViper() : base(new BotInfo(
-        "Greedy Viper",
+    public TankAlbino() : base(new BotInfo(
+        "TankAlbino",
         "1.0",
         new List<string> { "Ayam Gak Jago" },
         "Greedy score hunter with predictive firing and orbit evasion.",
@@ -104,6 +119,8 @@ public class GreedyViper : Bot
 
         while (IsRunning)
         {
+            PruneEnemyWaves();
+
             // Pilih target terbaik berdasarkan skor greedy
             Enemy? target = SelectGreedyTarget();
 
@@ -164,8 +181,10 @@ public class GreedyViper : Bot
             // kemungkinan musuh baru menembak — balik orbit untuk menghindar
             if (energyDrop > 0.09 && energyDrop <= 3.1 && enemy.Distance < 700)
             {
+                RegisterEnemyWave(e.ScannedBotId, e.X, e.Y, energyDrop);
                 panicUntil = Math.Max(panicUntil, TurnNumber + 10);
                 forcedRadarSweepUntil = Math.Max(forcedRadarSweepUntil, TurnNumber + 10);
+                duelJinkUntil = Math.Max(duelJinkUntil, TurnNumber + (energyDrop >= 2.0 ? 18 : 12));
                 ReverseOrbit();
             }
 
@@ -182,6 +201,8 @@ public class GreedyViper : Bot
         lastBulletHitTurn = TurnNumber;
         panicUntil = Math.Max(panicUntil, TurnNumber + 16);
         forcedRadarSweepUntil = Math.Max(forcedRadarSweepUntil, TurnNumber + 14);
+        duelJinkUntil = Math.Max(duelJinkUntil, TurnNumber + 18);
+        RemoveLikelyHitWave();
         ReverseOrbit();
     }
 
@@ -257,6 +278,8 @@ public class GreedyViper : Bot
             if (enemies.ContainsKey(e.VictimId))
                 enemies[e.VictimId].Alive = false;
         }
+
+        RemoveWavesFromEnemy(e.VictimId);
 
         if (lastTargetId == e.VictimId)
             lastTargetId = -1;
@@ -441,14 +464,8 @@ public class GreedyViper : Bot
             return;
         }
 
-        double distance = DistanceTo(target.X, target.Y);
-        bool nearWall = IsNearWall(WallMargin) || TurnNumber < forceCenterUntil;
-
-        // Paksa pembalikan orbit secara periodik agar pergerakan tidak terprediksi
-        if (TurnNumber - lastReverseTurn > 43)
-            ReverseOrbit();
-
-        double desiredHeading;
+        ControlDuelMovement(target);
+#if false
 
         if (nearWall)
         {
@@ -488,6 +505,163 @@ public class GreedyViper : Bot
             speedFactor = 0.65;
 
         MoveToward(desiredHeading, speedFactor);
+#endif
+    }
+
+    /// <summary>
+    /// Mode duel 1v1. Bot mengevaluasi kandidat arah dan kecepatan terhadap wave
+    /// peluru musuh yang terdeteksi dari energy drop, sehingga gerak tidak sekadar
+    /// orbit konstan yang mudah diprediksi.
+    /// </summary>
+    private void ControlDuelMovement(Enemy target)
+    {
+        double distance = DistanceTo(target.X, target.Y);
+        bool nearWall = IsNearWall(WallMargin) || TurnNumber < forceCenterUntil;
+        List<EnemyBulletWave> waves = GetEnemyWavesSnapshot();
+
+        if (nearWall)
+        {
+            double centerHeading = DirectionTo(ArenaWidth / 2.0, ArenaHeight / 2.0);
+            MoveToward(centerHeading, 0.72, target, GetFreshEnemies(MaxThreatAge));
+            return;
+        }
+
+        if (ShouldRam(target, distance))
+        {
+            MoveToward(DirectionTo(target.X, target.Y), 1.0, target, GetFreshEnemies(MaxThreatAge));
+            return;
+        }
+
+        if (waves.Count == 0 && TurnNumber - lastReverseTurn > 61)
+            ReverseOrbit();
+
+        double bestHeading = Direction;
+        double bestSpeedFactor = 1.0;
+        double bestScore = double.NegativeInfinity;
+        double toEnemy = DirectionTo(target.X, target.Y);
+        bool jinkMode = TurnNumber < duelJinkUntil || IsWaveImminent(waves);
+
+        List<double> headings = new List<double>
+        {
+            NormalizeAbsoluteAngle(toEnemy + 92.0 * orbitSign),
+            NormalizeAbsoluteAngle(toEnemy - 92.0 * orbitSign),
+            NormalizeAbsoluteAngle(toEnemy + 125.0 * orbitSign),
+            NormalizeAbsoluteAngle(toEnemy - 125.0 * orbitSign),
+            NormalizeAbsoluteAngle(toEnemy + 58.0 * orbitSign),
+            NormalizeAbsoluteAngle(toEnemy - 58.0 * orbitSign),
+            NormalizeAbsoluteAngle(toEnemy + 180.0),
+            DirectionTo(ArenaWidth / 2.0, ArenaHeight / 2.0),
+            NormalizeAbsoluteAngle(Direction + 35.0),
+            NormalizeAbsoluteAngle(Direction - 35.0)
+        };
+
+        double offset = (TurnNumber % 3) * 7.5;
+        for (int i = 0; i < 12; i++)
+            headings.Add(NormalizeAbsoluteAngle(i * 30.0 + offset));
+
+        double[] speedOptions = jinkMode
+            ? new[] { 1.0, 0.76, 0.42 }
+            : new[] { 1.0, 0.82 };
+
+        foreach (double heading in headings)
+        {
+            foreach (double speedFactor in speedOptions)
+            {
+                double projectionDistance = DuelProjectionDistance * (0.55 + speedFactor * 0.45);
+                AimPoint projected = Project(X, Y, heading, projectionDistance);
+                double score = ScoreDuelPosition(projected, heading, speedFactor, target, waves, jinkMode);
+
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestHeading = heading;
+                    bestSpeedFactor = speedFactor;
+                }
+            }
+        }
+
+        if (distance < 170.0)
+            bestSpeedFactor = Math.Min(bestSpeedFactor, 0.82);
+
+        MoveToward(bestHeading, bestSpeedFactor, target, GetFreshEnemies(MaxThreatAge));
+    }
+
+    /// <summary>
+    /// Skor kandidat posisi duel: makin aman dari wave peluru besar, makin jauh
+    /// dari dinding, makin lateral terhadap musuh, dan makin dekat ke jarak ideal.
+    /// </summary>
+    private double ScoreDuelPosition(
+        AimPoint point,
+        double moveHeading,
+        double speedFactor,
+        Enemy target,
+        List<EnemyBulletWave> waves,
+        bool jinkMode)
+    {
+        if (point.X < 18 || point.Y < 18 || point.X > ArenaWidth - 18 || point.Y > ArenaHeight - 18)
+            return -1000000.0;
+
+        double wallDistance = Math.Min(
+            Math.Min(point.X, ArenaWidth - point.X),
+            Math.Min(point.Y, ArenaHeight - point.Y)
+        );
+
+        double wallScore = Limit(wallDistance / 130.0, 0.0, 1.8) * 2.2;
+        double targetDistance = Distance(point.X, point.Y, target.X, target.Y);
+        double idealDistance = Energy > 32.0 ? 555.0 : 630.0;
+        double distanceScore = 1.0 - Math.Min(Math.Abs(targetDistance - idealDistance), 520.0) / 520.0;
+        double currentTargetDistance = DistanceTo(target.X, target.Y);
+        double tooClosePenalty = targetDistance < 260.0 ? (260.0 - targetDistance) / 42.0 : 0.0;
+        double movingCloserPenalty = targetDistance < currentTargetDistance && currentTargetDistance < 360.0
+            ? (currentTargetDistance - targetDistance) / 55.0
+            : 0.0;
+
+        double enemyDirection = DirectionTo(target.X, target.Y);
+        double lateralScore = Math.Abs(Math.Sin(ToRadians(NormalizeRelativeAngle(moveHeading - enemyDirection))));
+        double wavePenalty = 0.0;
+
+        foreach (EnemyBulletWave wave in waves)
+            wavePenalty += ScoreWaveDanger(point, moveHeading, wave);
+
+        double preferredSpeed = jinkMode && (TurnNumber / 4) % 2 == 0 ? 0.42 : 1.0;
+        double velocityChangeScore = jinkMode
+            ? 1.0 - Math.Min(Math.Abs(speedFactor - preferredSpeed), 1.0)
+            : speedFactor;
+
+        return wallScore
+            + distanceScore * 2.1
+            + lateralScore * 2.0
+            + velocityChangeScore * 0.85
+            - wavePenalty * (jinkMode ? 2.2 : 1.65)
+            - tooClosePenalty * 2.4
+            - movingCloserPenalty * 1.4;
+    }
+
+    /// <summary>
+    /// Menghitung bahaya kandidat posisi terhadap satu wave peluru musuh.
+    /// Penalti besar terjadi saat posisi kandidat dekat radius wave dan dekat
+    /// sudut tembak awal musuh.
+    /// </summary>
+    private double ScoreWaveDanger(AimPoint point, double moveHeading, EnemyBulletWave wave)
+    {
+        double waveRadius = wave.DistanceTraveled(TurnNumber);
+        double distanceFromSource = Distance(wave.SourceX, wave.SourceY, point.X, point.Y);
+        double timeDelta = distanceFromSource - waveRadius;
+
+        if (timeDelta < -90.0 || timeDelta > 260.0)
+            return 0.0;
+
+        double pointAngle = DirectionBetween(wave.SourceX, wave.SourceY, point.X, point.Y);
+        double angleOffset = Math.Abs(NormalizeRelativeAngle(pointAngle - wave.DirectAngle));
+        double timeUrgency = 1.0 - Math.Min(Math.Abs(timeDelta), 220.0) / 220.0;
+        double lineDanger = 1.0 - Math.Min(angleOffset, 42.0) / 42.0;
+        double bulletWeight = 0.7 + wave.FirePower / 2.2;
+
+        double sourceDirection = DirectionBetween(wave.SourceX, wave.SourceY, X, Y);
+        double lateralMovement = Math.Abs(Math.Sin(ToRadians(NormalizeRelativeAngle(moveHeading - sourceDirection))));
+        double lateralBonus = lateralMovement * 0.45;
+
+        return Math.Max(0.0, timeUrgency) * bulletWeight * (0.55 + lineDanger * 1.35 - lateralBonus);
     }
 
     /// <summary>
@@ -811,6 +985,131 @@ public class GreedyViper : Bot
     }
 
     /// <summary>
+    /// Mendaftarkan wave peluru musuh berdasarkan energy drop yang terlihat saat scan.
+    /// </summary>
+    private void RegisterEnemyWave(int enemyId, double sourceX, double sourceY, double firePower)
+    {
+        double bulletSpeed = CalcBulletSpeed(firePower);
+        double directAngle = DirectionBetween(sourceX, sourceY, X, Y);
+
+        lock (waveLock)
+        {
+            for (int i = enemyWaves.Count - 1; i >= 0; i--)
+            {
+                EnemyBulletWave existing = enemyWaves[i];
+                if (existing.EnemyId == enemyId && TurnNumber - existing.FireTurn <= 2)
+                    return;
+            }
+
+            enemyWaves.Add(new EnemyBulletWave
+            {
+                EnemyId = enemyId,
+                SourceX = sourceX,
+                SourceY = sourceY,
+                FirePower = firePower,
+                BulletSpeed = bulletSpeed,
+                DirectAngle = directAngle,
+                FireTurn = TurnNumber
+            });
+
+            while (enemyWaves.Count > MaxEnemyWaves)
+                enemyWaves.RemoveAt(0);
+        }
+    }
+
+    /// <summary>
+    /// Menghapus wave yang sudah terlalu jauh lewat dari posisi bot.
+    /// </summary>
+    private void PruneEnemyWaves()
+    {
+        lock (waveLock)
+        {
+            for (int i = enemyWaves.Count - 1; i >= 0; i--)
+            {
+                EnemyBulletWave wave = enemyWaves[i];
+                double waveRadius = wave.DistanceTraveled(TurnNumber);
+                double distanceToMe = Distance(wave.SourceX, wave.SourceY, X, Y);
+
+                if (waveRadius > distanceToMe + 160.0 || TurnNumber - wave.FireTurn > 95)
+                    enemyWaves.RemoveAt(i);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Mengambil snapshot wave agar movement tidak terganggu update event scan.
+    /// </summary>
+    private List<EnemyBulletWave> GetEnemyWavesSnapshot()
+    {
+        List<EnemyBulletWave> snapshot = new List<EnemyBulletWave>();
+
+        lock (waveLock)
+        {
+            foreach (EnemyBulletWave wave in enemyWaves)
+                snapshot.Add(wave.Clone());
+        }
+
+        return snapshot;
+    }
+
+    /// <summary>
+    /// Menghapus wave yang paling mungkin baru saja mengenai bot.
+    /// </summary>
+    private void RemoveLikelyHitWave()
+    {
+        lock (waveLock)
+        {
+            int bestIndex = -1;
+            double bestError = double.PositiveInfinity;
+
+            for (int i = 0; i < enemyWaves.Count; i++)
+            {
+                EnemyBulletWave wave = enemyWaves[i];
+                double error = Math.Abs(Distance(wave.SourceX, wave.SourceY, X, Y) - wave.DistanceTraveled(TurnNumber));
+
+                if (error < bestError)
+                {
+                    bestError = error;
+                    bestIndex = i;
+                }
+            }
+
+            if (bestIndex >= 0 && bestError < 90.0)
+                enemyWaves.RemoveAt(bestIndex);
+        }
+    }
+
+    /// <summary>
+    /// Membersihkan wave dari musuh yang sudah mati.
+    /// </summary>
+    private void RemoveWavesFromEnemy(int enemyId)
+    {
+        lock (waveLock)
+        {
+            for (int i = enemyWaves.Count - 1; i >= 0; i--)
+            {
+                if (enemyWaves[i].EnemyId == enemyId)
+                    enemyWaves.RemoveAt(i);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Mengecek apakah ada wave yang akan mencapai bot dalam beberapa giliran dekat.
+    /// </summary>
+    private bool IsWaveImminent(List<EnemyBulletWave> waves)
+    {
+        foreach (EnemyBulletWave wave in waves)
+        {
+            double remaining = Distance(wave.SourceX, wave.SourceY, X, Y) - wave.DistanceTraveled(TurnNumber);
+            if (remaining > -45.0 && remaining < wave.BulletSpeed * 8.0 + 50.0)
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
     /// Memperkirakan daya tembak optimal berdasarkan jarak, energi kita, energi musuh,
     /// dan keselarasan senjata. Daya lebih tinggi di jarak dekat, dikurangi saat
     /// energi kita rendah atau senjata tidak sejajar.
@@ -1003,6 +1302,15 @@ public class GreedyViper : Bot
     }
 
     /// <summary>
+    /// Menghitung arah absolut dari satu titik ke titik lain dengan konvensi sudut
+    /// yang sama seperti Project().
+    /// </summary>
+    private double DirectionBetween(double fromX, double fromY, double toX, double toY)
+    {
+        return NormalizeAbsoluteAngle(ToDegrees(Math.Atan2(toY - fromY, toX - fromX)));
+    }
+
+    /// <summary>
     /// Membalik arah orbit (orbitSign). Ada jeda minimum 8 giliran antar pembalikan
     /// untuk mencegah bot bolak-balik terlalu cepat yang bisa dieksploitasi musuh.
     /// </summary>
@@ -1024,6 +1332,9 @@ public class GreedyViper : Bot
         lock (enemyLock)
             enemies.Clear();
 
+        lock (waveLock)
+            enemyWaves.Clear();
+
         orbitSign = 1;
         radarSign = 1;
         lastReverseTurn = -999;
@@ -1032,6 +1343,7 @@ public class GreedyViper : Bot
         panicUntil = 0;
         forcedRadarSweepUntil = 0;
         lastBulletHitTurn = -999;
+        duelJinkUntil = 0;
     }
 
     /// <summary>
@@ -1093,6 +1405,31 @@ public class GreedyViper : Bot
         public Enemy Clone()
         {
             return (Enemy)MemberwiseClone();
+        }
+    }
+
+    /// <summary>
+    /// Representasi wave peluru musuh yang dideteksi dari energy drop.
+    /// Radius wave bertambah sebesar BulletSpeed setiap giliran sejak FireTurn.
+    /// </summary>
+    private sealed class EnemyBulletWave
+    {
+        public int EnemyId;
+        public double SourceX;
+        public double SourceY;
+        public double FirePower;
+        public double BulletSpeed;
+        public double DirectAngle;
+        public int FireTurn;
+
+        public double DistanceTraveled(int currentTurn)
+        {
+            return Math.Max(0, currentTurn - FireTurn) * BulletSpeed;
+        }
+
+        public EnemyBulletWave Clone()
+        {
+            return (EnemyBulletWave)MemberwiseClone();
         }
     }
 
