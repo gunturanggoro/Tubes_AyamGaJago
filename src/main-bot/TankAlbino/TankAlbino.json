@@ -4,7 +4,7 @@
     "authors": [
         "Ayam gak Jago"
     ],
-    "description": "Greedy score hunter with predictive firing and orbit evasion.",
+    "description": "Bot ini mengimplementasikan algoritma greedy dengan pendekatan \"serangan dan pertahanan ditentukan melalui pemilihan target berbasis skor, tembakan prediktif, orbit evasion, dan pergerakan adaptif.\"",
     "homepage": "",
     "countryCodes": [
         "ID"

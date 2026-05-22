@@ -488,11 +488,10 @@ public class TankAlbino : Bot
     }
 
     /// <summary>
-    /// Mengontrol pergerakan bot setiap giliran. Memilih strategi berdasarkan kondisi:
-    /// - Dekat dinding atau paksa ke tengah → bergerak ke tengah arena
-    /// - Kondisi memungkinkan ram → men突突 ke arah musuh
-    /// - Normal → orbit melingkar di sekitar musuh dengan sudut adaptif
-    /// Juga membalik arah jika terlalu lama tidak berputar.
+    /// Mengontrol pergerakan bot setiap giliran.
+    /// Fungsi ini menentukan apakah bot harus memakai mode duel 1v1 atau mode melee.
+    /// Jika musuh masih banyak, bot memakai ControlMeleeMovement().
+    /// Jika hanya duel, bot memakai ControlDuelMovement().
     /// </summary>
     private void ControlMovement(Enemy target)
     {
@@ -1559,25 +1558,52 @@ public class TankAlbino : Bot
         }
     }
 
-    /// <summary>
-    /// Representasi wave peluru musuh yang dideteksi dari energy drop.
-    /// Radius wave bertambah sebesar BulletSpeed setiap giliran sejak FireTurn.
+        /// <summary>
+    /// Representasi wave peluru musuh yang dideteksi dari penurunan energi musuh.
+    /// Konsep wave digunakan untuk memperkirakan lintasan peluru musuh.
+    /// Setiap wave menyimpan posisi musuh saat menembak, daya tembak, kecepatan peluru,
+    /// arah tembakan awal, dan giliran saat peluru ditembakkan.
     /// </summary>
     private sealed class EnemyBulletWave
     {
+        // ID musuh yang diperkirakan menembakkan peluru.
         public int EnemyId;
+
+        // Koordinat X posisi musuh saat peluru ditembakkan.
         public double SourceX;
+
+        // Koordinat Y posisi musuh saat peluru ditembakkan.
         public double SourceY;
+
+        // Daya tembak peluru musuh yang diperkirakan dari penurunan energi.
         public double FirePower;
+
+        // Kecepatan peluru berdasarkan FirePower.
+        // Semakin besar FirePower, semakin lambat pelurunya.
         public double BulletSpeed;
+
+        // Arah langsung dari posisi musuh menuju bot saat peluru ditembakkan.
+        // Digunakan untuk memperkirakan area bahaya dari wave.
         public double DirectAngle;
+
+        // Nomor giliran saat peluru diperkirakan ditembakkan.
         public int FireTurn;
 
+        /// <summary>
+        /// Menghitung jarak yang sudah ditempuh wave peluru sejak ditembakkan.
+        /// Rumusnya adalah selisih turn saat ini dengan FireTurn dikalikan BulletSpeed.
+        /// Fungsi ini digunakan untuk mengetahui apakah wave peluru sudah mendekati posisi bot.
+        /// </summary>
         public double DistanceTraveled(int currentTurn)
         {
             return Math.Max(0, currentTurn - FireTurn) * BulletSpeed;
         }
 
+        /// <summary>
+        /// Membuat salinan objek EnemyBulletWave.
+        /// Salinan ini digunakan agar proses evaluasi movement tidak langsung memakai objek asli
+        /// yang mungkin sedang diperbarui oleh event scan.
+        /// </summary>
         public EnemyBulletWave Clone()
         {
             return (EnemyBulletWave)MemberwiseClone();
@@ -1585,14 +1611,22 @@ public class TankAlbino : Bot
     }
 
     /// <summary>
-    /// Struct ringan untuk merepresentasikan koordinat titik tujuan (X, Y),
-    /// digunakan sebagai hasil prediksi posisi musuh dan proyeksi pergerakan.
+    /// Struct ringan untuk merepresentasikan koordinat titik tujuan atau titik bidik.
+    /// AimPoint digunakan untuk menyimpan hasil prediksi posisi musuh,
+    /// hasil proyeksi gerakan bot, dan kandidat posisi dalam evaluasi greedy.
     /// </summary>
     private readonly struct AimPoint
     {
+        // Koordinat X titik.
         public readonly double X;
+
+        // Koordinat Y titik.
         public readonly double Y;
 
+        /// <summary>
+        /// Constructor untuk membuat objek AimPoint berdasarkan koordinat X dan Y.
+        /// Fungsi ini memudahkan penyimpanan pasangan koordinat sebagai satu objek.
+        /// </summary>
         public AimPoint(double x, double y)
         {
             X = x;
