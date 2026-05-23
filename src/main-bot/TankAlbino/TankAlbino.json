@@ -1,8 +1,8 @@
 {
-    "name": "TankAlbino",
+    "name": "Ayam gak Jago",
     "version": "2.0",
     "authors": [
-        "Ayam gak Jago"
+        "Guntur Anggoro", "M Radhitya", "Dina Olivia"
     ],
     "description": "Bot ini mengimplementasikan algoritma greedy dengan pendekatan \"serangan dan pertahanan ditentukan melalui pemilihan target berbasis skor, tembakan prediktif, orbit evasion, dan pergerakan adaptif.\"",
     "homepage": "",

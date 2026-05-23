@@ -1,8 +1,8 @@
 {
-  "name": "BantengMerah",
+  "name": "Ayam Gak Jago",
   "version": "1.5",
   "authors": [
-    "Ayam Gak Jago"
+    "Guntur Anggoro", "M Radhitya", "Dina Olivia"
   ],
   "description": "Bot ini mengimplementasikan algoritma greedy dengan pendekatan \"selalu kejar dan tabrak musuh yang paling mudah dijangkau\".",
   "homepage": "",

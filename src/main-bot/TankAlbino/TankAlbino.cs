@@ -69,7 +69,7 @@ public class TankAlbino : Bot
     /// (nama, versi, penulis, deskripsi, bahasa, kategori, dll).
     /// </summary>
     public TankAlbino() : base(new BotInfo(
-        "TankAlbino",
+        "Ayam Gak Jago",
         "2.0",
         new List<string> { "Ayam Gak Jago" },
         "Bot ini mengimplementasikan algoritma greedy dengan pendekatan \"serangan dan pertahanan ditentukan melalui pemilihan target berbasis skor, tembakan prediktif, orbit evasion, dan pergerakan adaptif.\"",

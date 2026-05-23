@@ -1,0 +1,16 @@
+{
+  "name": "Ayam Gak Jago",
+  "version": "4.0",
+  "authors": [
+    "Guntur Anggoro",
+    "M Radhitya",
+    "Dina Olivia"
+  ],
+  "description": "Bot ini mengimplementasikan algoritma greedy dengan pendekatan  pergerakan berbasis mode, penilaian posisi, dan penembakan prediktif.",
+  "homepage": "",
+  "countryCodes": [
+    "ID"
+  ],
+  "platform": ".Net 10.0",
+  "programmingLang": "C# 10.0"
+}
